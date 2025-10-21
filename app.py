@@ -8,6 +8,7 @@ import os
 # --- AI INTEGRATION SETUP ---
 from google import genai
 from google.genai import types 
+from google.genai.errors import APIError
 
 @st.cache_resource(show_spinner=False)
 def get_gemini_client():
@@ -21,6 +22,7 @@ def get_gemini_client():
     try:
         return genai.Client()
     except Exception as e:
+        # Note: This error will only show if the key is present but invalid/malformed
         st.error(f"Error initializing Gemini client: {e}")
         return None
 
@@ -99,9 +101,7 @@ BANK_RULES_MAP = {
 # --- 2. HELPER FUNCTIONS ---
 
 def detect_bank_format(text_content: str) -> str:
-    """
-    Identifies the bank statement format using robust, case-insensitive keyword matching.
-    """
+    """Identifies the bank statement format using robust, case-insensitive keyword matching."""
     lower_text = re.sub(r'\s+', ' ', text_content.lower())
 
     for bank, keywords in BANK_RULES_LIST:
@@ -110,52 +110,10 @@ def detect_bank_format(text_content: str) -> str:
             
     return "GENERIC"
 
-def ai_analyze_statement(text_content: str, file_name: str) -> tuple[str, str]:
-    """
-    Uses Gemini to analyze the statement text and provide a structured hint.
-    """
-    
-    if not client:
-        return "GENERIC", "AI analysis skipped: Gemini client not initialized. Please set **GEMINI_API_KEY** in Streamlit Secrets."
-
-    prompt = f"""
-Analyze the text from a South African bank statement '{file_name}'.
-Identify the full name of the bank and suggest the best two to three keywords for a detection rule for the Python code.
-Output your analysis in a concise JSON format:
-{{
-   "identified_bank_name": "Full bank name (e.g., Capitec Bank, Nedbank)",
-   "developer_notes": "Brief note on table structure (e.g., Single amount column with +/- sign, or Separate Debit/Credit columns).",
-   "suggested_keywords": ["keyword1", "keyword2"]
-}}
-TEXT CONTENT START: {text_content[:8000]} TEXT CONTENT END
-"""
-    
-    try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=[prompt],
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        
-        import json
-        ai_data = json.loads(response.text)
-        
-        bank = ai_data.get('identified_bank_name', 'Unknown Bank')
-        notes = ai_data.get('developer_notes', 'No notes.')
-        keywords = ", ".join(ai_data.get('suggested_keywords', []))
-        
-        return "GENERIC", f"AI Suggestion: **{bank}**. Notes: {notes}. Keywords: {keywords}"
-        
-    except Exception as e:
-        return "GENERIC", f"AI analysis failed: {e}. Check API key and configuration."
-        
-    return "GENERIC", f"AI analysis is currently **MOCKED**. Please configure the **Gemini API** for this feature to work."
-
 
 def clean_value(value):
     """Cleans numeric values by handling SA (comma for decimal, space/dot for thousands) format."""
-    if not isinstance(value, str):
-        return None
+    if not isinstance(value, str): return None
         
     value = str(value).replace('\n', '').replace('\r', '') 
     value = re.sub(r'(\d)\s+(\d)', r'\1\2', value) 
@@ -176,22 +134,23 @@ def clean_value(value):
 
 def clean_description_for_xero(description):
     """Cleans up transaction descriptions for easy Xero reconciliation."""
-    if not isinstance(description, str):
-        return ""
+    if not isinstance(description, str): return ""
         
     description = description.strip()
     
+    # Remove common reference/date patterns left over by extraction
     description = re.sub(r'\s*\d{6}\s+\d{4}\s+\d{2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)', '', description, flags=re.IGNORECASE)
     description = re.sub(r'(?:Ref\s*|Reference\s*|No\s*|Nr\s*|ID\s*):\s*[\w\d\-]+', '', description, flags=re.IGNORECASE)
     description = re.sub(r'Serial:\d+/\d+', '', description)
 
+    # Remove common transaction type prefixes
     description = re.sub(r'(?:POS Purchase|ATM Withdrawal|Immediate Payment|Internet Pmt To|Teller Transfer Debit|Direct Credit|EFT|IB Payment)\s*', '', description, flags=re.IGNORECASE)
     
     description = re.sub(r'\s{2,}', ' ', description).strip(' -').strip()
     
     return description
 
-# --- 3. STANDARDIZATION FUNCTIONS ---
+# --- 3. STANDARDIZATION FUNCTIONS (UNCHANGED) ---
 
 def standardize_fnb(df):
     df.columns = [c.lower().replace(' ', '_') for c in df.columns]
@@ -210,11 +169,7 @@ def standardize_fnb(df):
 
 def standardize_standard(df):
     """
-    UPDATED: Robustly remaps and cleans columns for Standard Bank.
-    The Standard Bank format uses: Details, Service Fee, Debits, Credits, Date, Balance.
-    pdfplumber often extracts headers as [Details, Service Fee, Debits, Credits, Date, Balance]
-    but sometimes gets them as [0, 1, 2, 3, 4, 5] if the row extraction misses the header.
-    We check for the missing column and apply the expected column names if necessary.
+    Robustly remaps and cleans columns for Standard Bank.
     """
     
     # Standard Bank uses 6 columns. Check if headers are missing (i.e., column names are integers)
@@ -256,38 +211,106 @@ def standardize_hbz(df):
     return df[['Date', 'Description', 'Amount']]
 
 def generic_fallback(df):
+    # This is for the pdfplumber generic attempt. The main Gemini fallback is in the core function.
     st.warning("Could not apply specific standardization. CSV will contain raw extracted columns.")
     return df 
 
+# --- 4. CORE EXTRACTION LOGIC (UPDATED WITH GEMINI FALLBACK) ---
 
-# --- 4. CORE EXTRACTION LOGIC ---
+def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> pd.DataFrame:
+    """
+    FALLBACK: Uses Gemini's vision capability to perform OCR and structured data extraction
+    from the PDF, which works for both text-based and scanned/image-based files.
+    """
+    st.info("🔄 **Initiating Gemini OCR/Extraction Fallback...** (This may take a moment)")
+    if not client:
+        st.error("Gemini client is inactive. Cannot run OCR fallback.")
+        return pd.DataFrame()
+
+    try:
+        # Create a Part object from the raw PDF bytes
+        pdf_part = types.Part.from_bytes(
+            data=pdf_file_path.getvalue(),
+            mime_type='application/pdf'
+        )
+        
+        prompt = f"""
+            You are a South African accounting assistant. Your task is to extract all transaction lines 
+            from the provided bank statement PDF ({file_name}). 
+            The output **must be a single JSON list** where each item is a transaction.
+            
+            **Required Columns (MUST be included):**
+            1.  'Date': The transaction date (in any format, e.g., '2024/03/16', '16 Mar', '03 16').
+            2.  'Description': A clean, single-line description of the transaction.
+            3.  'Amount': The Rand amount. Debits must be negative (e.g., -100.00), Credits must be positive (e.g., 500.00).
+
+            **Example JSON Output (Mandatory format):**
+            [
+              {{
+                "Date": "16 Mar 2024",
+                "Description": "IMMEDIATE PAYMENT 145089014 FAWZIA BAYAT",
+                "Amount": -2500.00
+              }},
+              {{
+                "Date": "16 Mar 2024",
+                "Description": "CREDIT TRANSFER SALARY DEPOSIT",
+                "Amount": 15000.00
+              }}
+            ]
+        """
+        
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[prompt, pdf_part],
+            config=types.GenerateContentConfig(response_mime_type="application/json")
+        )
+
+        import json
+        
+        # Clean the response text (sometimes LLMs wrap the JSON in markdown)
+        json_text = response.text.strip().strip('```json').strip('```')
+        
+        data = json.loads(json_text)
+        
+        if isinstance(data, list) and data:
+            st.success(f"Gemini Fallback successful! Extracted {len(data)} transactions.")
+            return pd.DataFrame(data)
+        else:
+            st.error("Gemini extracted a result, but it was empty or not a valid list of transactions.")
+            return pd.DataFrame()
+            
+    except APIError as e:
+        st.error(f"Gemini API Error: {e}. Check your API key or contact support.")
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"Gemini Fallback failed due to an unexpected error. Error: {e}")
+        return pd.DataFrame()
+
 
 def parse_pdf_data(pdf_file_path, file_name):
     """Core function to extract tables, detect bank, and standardize the data."""
     all_transactions = pd.DataFrame()
     bank_name = "GENERIC"
+    
+    full_text = ""
 
     try:
+        # 1. First attempt: Use pdfplumber for detection and extraction
         with pdfplumber.open(pdf_file_path) as pdf:
             
-            # 1. Detect Bank 
+            # Detect Bank using simple text extraction
             full_text = " ".join(page.extract_text() for page in pdf.pages if page.extract_text())
             bank_name = detect_bank_format(full_text)
             
+            rules = BANK_RULES_MAP.get(bank_name, BANK_RULES_MAP["GENERIC"])
+
             if bank_name == "GENERIC":
-                    st.warning("⚠️ Could not reliably identify the bank statement format. Attempting AI analysis...")
-                    
-                    # --- AI FALLBACK INTEGRATION POINT ---
-                    _ , ai_message = ai_analyze_statement(full_text, file_name)
-                    st.markdown(f"**AI Report for Developer:** {ai_message}")
-                    
-                    st.info("Using **Generic Fallback** rules for table extraction.")
+                st.warning("⚠️ Could not reliably identify the bank statement format.")
             else:
                 st.info(f"✅ Detected Bank: **{bank_name}**. Applying custom parsing rules.")
             
-            rules = BANK_RULES_MAP[bank_name]
             
-            # 2. Extract Data Page by Page
+            # 2. Extract Data Page by Page using pdfplumber's rules
             for page in pdf.pages:
                 tables = page.extract_tables(rules["table_settings"])
                 
@@ -295,52 +318,66 @@ def parse_pdf_data(pdf_file_path, file_name):
                     if table and len(table) > 1:
                         # Skip header rows
                         start_index = 0
-                        # Standard Bank sometimes has "Balance" split over two lines, so use "BAL"
                         for i, row in enumerate(table):
-                            if any("BAL" in str(cell).upper() for cell in row if cell):
+                            if any("BAL" in str(cell).upper() for cell in row if cell) or \
+                               any("AMOUNT" in str(cell).upper() for cell in row if cell):
                                 start_index = i + 1
                                 break
                         data_rows = table[start_index:]
                         
                         if not data_rows: continue
                         
-                        try:
-                            # Use detected column names from rules if the table has the correct number of columns
-                            # NOTE: We skip assigning column names here to let the standardize function handle 
-                            # the naming/remapping more flexibly, which is safer.
-                            df = pd.DataFrame(data_rows)
-                        except:
-                            df = pd.DataFrame(data_rows)
-
+                        df = pd.DataFrame(data_rows)
                         all_transactions = pd.concat([all_transactions, df], ignore_index=True)
                             
-            # 3. Standardization & Final Formatting
-            if not all_transactions.empty:
-                all_transactions.dropna(thresh=2, inplace=True)
+        # 3. Standardization & Final Formatting (Only if pdfplumber found data)
+        if not all_transactions.empty:
+            all_transactions.dropna(thresh=2, inplace=True)
+            
+            standardize_func_name = rules["standardize_func"]
+            if standardize_func_name == "standardize_fnb":
+                df_final = standardize_fnb(all_transactions.copy())
+            elif standardize_func_name == "standardize_standard":
+                df_final = standardize_standard(all_transactions.copy())
+            elif standardize_func_name == "standardize_absa":
+                df_final = standardize_absa(all_transactions.copy())
+            elif standardize_func_name == "standardize_hbz":
+                df_final = standardize_hbz(all_transactions.copy())
+            else: 
+                df_final = generic_fallback(all_transactions.copy())
                 
-                standardize_func_name = rules["standardize_func"]
-                if standardize_func_name == "standardize_fnb":
-                    df_final = standardize_fnb(all_transactions.copy())
-                elif standardize_func_name == "standardize_standard":
-                    df_final = standardize_standard(all_transactions.copy())
-                elif standardize_func_name == "standardize_absa":
-                    df_final = standardize_absa(all_transactions.copy())
-                elif standardize_func_name == "standardize_hbz":
-                    df_final = standardize_hbz(all_transactions.copy())
-                else: 
-                    return generic_fallback(all_transactions.copy()), bank_name
-                
-                df_final.dropna(subset=['Amount'], inplace=True)
-                
+            df_final.dropna(subset=['Amount'], inplace=True)
+            
+            if not df_final.empty:
+                st.success("pdfplumber extracted transactions successfully.")
                 return df_final, bank_name
+            else:
+                st.warning("pdfplumber extracted data but standardization failed. Falling back to Gemini.")
 
     except Exception as e:
-        # Improved error message to help with column key debugging
-        st.error(f"An error occurred during PDF processing for {file_name}. Error: {e}")
-        st.info("This often happens when `pdfplumber` cannot find a text layer (i.e., it's a scanned image) or the PDF is malformed, OR if the required column names for a detected bank (e.g., 'Debits') were not extracted properly.")
-        return pd.DataFrame(), bank_name
+        st.warning(f"pdfplumber failed for {file_name}. Reason: '{e}'. Trying Gemini fallback...")
+        
+    # --- PHASE 2: GEMINI FALLBACK (If pdfplumber fails or returns no clean data) ---
     
-    return pd.DataFrame(), bank_name
+    # Reset buffer position for Gemini function
+    pdf_file_path.seek(0)
+    
+    df_gemini = gemini_extract_from_pdf(pdf_file_path, file_name)
+    
+    if not df_gemini.empty:
+        # Standardize the Gemini-extracted DataFrame to ensure consistent column names
+        df_gemini['Date'] = df_gemini['Date'].astype(str)
+        df_gemini['Description'] = df_gemini['Description'].astype(str)
+        
+        # Convert amount to float, ensuring negative debits are preserved
+        df_gemini['Amount'] = df_gemini['Amount'].apply(lambda x: clean_value(str(x))) 
+        df_gemini.dropna(subset=['Amount'], inplace=True)
+        
+        if not df_gemini.empty:
+            return df_gemini[['Date', 'Description', 'Amount']], "AI_EXTRACTED"
+        
+    st.error(f"Both pdfplumber and Gemini extraction failed for {file_name}.")
+    return pd.DataFrame(), "FAILED"
 
 # --- 5. STREAMLIT APP LOGIC ---
 
@@ -351,16 +388,16 @@ st.set_page_config(page_title="🇿🇦 Free SA Bank Statement to Xero CSV Conve
 
 st.title("🇿🇦 SA Bank Statement PDF to Xero CSV Converter")
 st.markdown("""
-    ### Built by Gemini AI for accountants: Free, easy-to-use tool for South African bank statement conversion.
+    ### Built with Gemini AI for accountants: Free, robust tool for South African bank statement conversion.
     
-    **Supported Banks (with custom rules): ABSA, FNB, Standard Bank, HBZ.**
+    **Supported Banks (with custom rules): ABSA, FNB, Standard Bank, HBZ.** Uses **Gemini AI** as a powerful **fallback** for **scanned or difficult PDFs**.
     ---
 """)
 
 if client:
-    st.sidebar.success("Gemini AI Analysis: **Active** ✅")
+    st.sidebar.success("Gemini AI Fallback/OCR: **Active** ✅")
 else:
-    st.sidebar.warning("Gemini AI Analysis: **Inactive** 🛑. Please set **GEMINI_API_KEY** in Streamlit Secrets.")
+    st.sidebar.warning("Gemini AI Fallback/OCR: **Inactive** 🛑. Please set **GEMINI_API_KEY** in Streamlit Secrets.")
 
 
 uploaded_files = st.file_uploader(
@@ -382,10 +419,12 @@ if uploaded_files:
         
         pdf_data = BytesIO(uploaded_file.read())
         
+        # CORE CALL: attempts pdfplumber first, then falls back to Gemini
         df_transactions, bank_name = parse_pdf_data(pdf_data, file_name)
 
         if not df_transactions.empty and 'Amount' in df_transactions.columns:
             
+            # Apply final cleaning and formatting
             df_transactions['Description'] = df_transactions['Description'].apply(clean_description_for_xero)
             
             df_final = df_transactions.rename(columns={
@@ -395,9 +434,10 @@ if uploaded_files:
             })
             
             try:
+                # Attempt to parse date in SA format (day/month/year)
                 df_final['Date'] = pd.to_datetime(df_final['Date'], errors='coerce', dayfirst=True).dt.strftime('%d/%m/%Y')
-            except:
-                st.warning(f"Could not standardize dates for {file_name}.")
+            except Exception as e:
+                st.warning(f"Could not standardize dates for {file_name}. Dates remain in raw format. Error: {e}")
             
             # Final Xero structure: Date, Amount, Payee, Description, Reference
             df_xero = pd.DataFrame({
@@ -425,6 +465,7 @@ if uploaded_files:
         
         st.dataframe(final_combined_df)
         
+        # Convert DataFrame to CSV for download
         csv_output = final_combined_df.to_csv(index=False, sep=',', encoding='utf-8')
         st.download_button(
             label="⬇️ Download Xero Ready CSV File",
