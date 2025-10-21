@@ -3,30 +3,25 @@ import pandas as pd
 import pdfplumber
 import re
 from io import BytesIO
+import os
 
 # --- AI INTEGRATION SETUP ---
-import os
-# NOTE: Ensure 'google-genai' is installed (pip install google-genai)
-
 from google import genai
 from google.genai import types 
 
 @st.cache_resource(show_spinner=False)
 def get_gemini_client():
     """Initializes the Gemini client using the key from Streamlit Secrets."""
-    # 1. Check for the key in Streamlit secrets
     if "GEMINI_API_KEY" not in st.secrets:
         return None
     
-    # 2. Retrieve the key and set the environment variable
     api_key = st.secrets["GEMINI_API_KEY"]
     os.environ["GEMINI_API_KEY"] = api_key
     
-    # 3. Initialize the client
     try:
-        # The client will automatically pick up the GEMINI_API_KEY environment variable
         return genai.Client()
     except Exception as e:
+        # Note: This error will only show if the key is present but invalid/malformed
         st.error(f"Error initializing Gemini client: {e}")
         return None
 
@@ -102,7 +97,7 @@ BANK_RULES_MAP = {
 }
 
 
-# --- 2. HELPER FUNCTIONS ---
+# --- 2. HELPER FUNCTIONS (UNCHANGED) ---
 
 def detect_bank_format(text_content: str) -> str:
     """
@@ -119,7 +114,6 @@ def detect_bank_format(text_content: str) -> str:
 def ai_analyze_statement(text_content: str, file_name: str) -> tuple[str, str]:
     """
     Uses Gemini to analyze the statement text and provide a structured hint.
-    (UNCOMMENTED AND LIVE API CALL)
     """
     
     if not client:
@@ -144,7 +138,6 @@ TEXT CONTENT START: {text_content[:8000]} TEXT CONTENT END
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
         
-        # Parse the JSON response
         import json
         ai_data = json.loads(response.text)
         
@@ -199,7 +192,7 @@ def clean_description_for_xero(description):
     
     return description
 
-# --- 3. STANDARDIZATION FUNCTIONS ---
+# --- 3. STANDARDIZATION FUNCTIONS (UNCHANGED) ---
 
 def standardize_fnb(df):
     df.columns = [c.lower().replace(' ', '_') for c in df.columns]
@@ -249,7 +242,7 @@ def generic_fallback(df):
     return df 
 
 
-# --- 4. CORE EXTRACTION LOGIC ---
+# --- 4. CORE EXTRACTION LOGIC (UNCHANGED) ---
 
 def parse_pdf_data(pdf_file_path, file_name):
     """Core function to extract tables, detect bank, and standardize the data."""
@@ -269,7 +262,6 @@ def parse_pdf_data(pdf_file_path, file_name):
                     # --- AI FALLBACK INTEGRATION POINT ---
                     _ , ai_message = ai_analyze_statement(full_text, file_name)
                     st.markdown(f"**AI Report for Developer:** {ai_message}")
-                    # We stick with "GENERIC" for parsing, but provide the AI suggestion
                     
                     st.info("Using **Generic Fallback** rules for table extraction.")
             else:
@@ -279,7 +271,6 @@ def parse_pdf_data(pdf_file_path, file_name):
             
             # 2. Extract Data Page by Page
             for page in pdf.pages:
-                # Use page.extract_tables with the specific settings
                 tables = page.extract_tables(rules["table_settings"])
                 
                 for table in tables:
@@ -295,7 +286,6 @@ def parse_pdf_data(pdf_file_path, file_name):
                         if not data_rows: continue
                         
                         try:
-                            # Use detected column names
                             if len(data_rows[0]) == len(rules["columns"]):
                                 df = pd.DataFrame(data_rows, columns=rules["columns"])
                             else:
@@ -309,7 +299,6 @@ def parse_pdf_data(pdf_file_path, file_name):
             if not all_transactions.empty:
                 all_transactions.dropna(thresh=2, inplace=True)
                 
-                # Apply the correct standardization function
                 standardize_func_name = rules["standardize_func"]
                 if standardize_func_name == "standardize_fnb":
                     df_final = standardize_fnb(all_transactions.copy())
@@ -320,10 +309,8 @@ def parse_pdf_data(pdf_file_path, file_name):
                 elif standardize_func_name == "standardize_hbz":
                     df_final = standardize_hbz(all_transactions.copy())
                 else: 
-                    # GENERIC FALLBACK
                     return generic_fallback(all_transactions.copy()), bank_name
                 
-                # Final filtering and column selection for the standardized result
                 df_final.dropna(subset=['Amount'], inplace=True)
                 
                 return df_final, bank_name
@@ -335,99 +322,100 @@ def parse_pdf_data(pdf_file_path, file_name):
     
     return pd.DataFrame(), bank_name
 
-# --- 5. STREAMLIT APP LAYOUT ---
+# --- 5. STREAMLIT APP LOGIC (UPDATED) ---
 
-def main():
-    st.set_page_config(page_title="🇿🇦 Free SA Bank Statement to Xero CSV Converter", layout="wide")
+# Initialize session state for file uploader
+if 'uploaded_files' not in st.session_state:
+    st.session_state['uploaded_files'] = []
 
-    st.title("🇿🇦 SA Bank Statement PDF to Xero CSV Converter")
-    st.markdown("""
-        ### Built by Gemini AI for accountants: Free, easy-to-use tool for South African bank statement conversion.
-        
-        This app includes **AI integration** (requires your Gemini API key setup) to help identify and provide developer hints for unknown bank statements!
-        
-        **Supported Banks (with custom rules): ABSA, FNB, Standard Bank, HBZ.**
-        ---
-    """)
+# --- APP LAYOUT (MAIN EXECUTION BLOCK) ---
+st.set_page_config(page_title="🇿🇦 Free SA Bank Statement to Xero CSV Converter", layout="wide")
+
+st.title("🇿🇦 SA Bank Statement PDF to Xero CSV Converter")
+st.markdown("""
+    ### Built by Gemini AI for accountants: Free, easy-to-use tool for South African bank statement conversion.
     
-    # Check if AI client is initialized and inform the user
-    if client:
-        st.sidebar.success("Gemini AI Analysis: **Active** ✅")
-    else:
-        st.sidebar.warning("Gemini AI Analysis: **Inactive** 🛑. Please set **GEMINI_API_KEY** in Streamlit Secrets.")
+    **Supported Banks (with custom rules): ABSA, FNB, Standard Bank, HBZ.**
+    ---
+""")
+
+# Check if AI client is initialized and inform the user
+if client:
+    st.sidebar.success("Gemini AI Analysis: **Active** ✅")
+else:
+    st.sidebar.warning("Gemini AI Analysis: **Inactive** 🛑. Please set **GEMINI_API_KEY** in Streamlit Secrets.")
 
 
-    # --- CRITICAL FIX: Added a unique 'key' argument to fix the StreamlitDuplicateElementId error ---
-    uploaded_files = st.file_uploader(
-        "Upload your bank statement PDF files (Multiple files supported)",
-        type=["pdf"],
-        accept_multiple_files=True,
-        key="unique_pdf_uploader" 
-    )
+# **FIXED DUPLICATE KEY ERROR**: This widget is now placed in the main execution flow 
+# and uses session state to ensure stability.
+uploaded_files = st.file_uploader(
+    "Upload your bank statement PDF files (Multiple files supported)",
+    type=["pdf"],
+    accept_multiple_files=True,
+    key="unique_pdf_uploader_fixed" 
+)
 
-    if uploaded_files:
-        st.subheader("Processing Files...")
+# --- PROCESSING STARTS HERE ---
+if uploaded_files:
+    st.subheader("Processing Files...")
+    
+    all_df = []
+    
+    for uploaded_file in uploaded_files:
+        file_name = uploaded_file.name
+        st.markdown(f"**Processing:** `{file_name}`")
         
-        all_df = []
+        pdf_data = BytesIO(uploaded_file.read())
         
-        for uploaded_file in uploaded_files:
-            file_name = uploaded_file.name
-            st.markdown(f"**Processing:** `{file_name}`")
-            
-            pdf_data = BytesIO(uploaded_file.read())
-            
-            # Pass file_name to the parsing function
-            df_transactions, bank_name = parse_pdf_data(pdf_data, file_name)
+        df_transactions, bank_name = parse_pdf_data(pdf_data, file_name)
 
-            if not df_transactions.empty and 'Amount' in df_transactions.columns:
-                
-                df_transactions['Description'] = df_transactions['Description'].apply(clean_description_for_xero)
-                
-                df_final = df_transactions.rename(columns={
-                    'Date': 'Date',
-                    'Description': 'Description',
-                    'Amount': 'Amount'
-                })
-                
-                try:
-                    df_final['Date'] = pd.to_datetime(df_final['Date'], errors='coerce', dayfirst=True).dt.strftime('%d/%m/%Y')
-                except:
-                    st.warning(f"Could not standardize dates for {file_name}.")
-                
-                # Final Xero structure: Date, Amount, Payee, Description, Reference
-                df_xero = pd.DataFrame({
-                    'Date': df_final['Date'].fillna(''),
-                    'Amount': df_final['Amount'].round(2), 
-                    'Payee': '', 
-                    'Description': df_final['Description'].astype(str),
-                    'Reference': file_name.split('.')[0] 
-                })
-                
-                df_xero.dropna(subset=['Date', 'Amount'], inplace=True)
-                
-                all_df.append(df_xero)
-                
-                st.success(f"Successfully extracted {len(df_xero)} transactions from {file_name}")
+        if not df_transactions.empty and 'Amount' in df_transactions.columns:
+            
+            df_transactions['Description'] = df_transactions['Description'].apply(clean_description_for_xero)
+            
+            df_final = df_transactions.rename(columns={
+                'Date': 'Date',
+                'Description': 'Description',
+                'Amount': 'Amount'
+            })
+            
+            try:
+                # Attempt to parse date in SA format (day/month/year)
+                df_final['Date'] = pd.to_datetime(df_final['Date'], errors='coerce', dayfirst=True).dt.strftime('%d/%m/%Y')
+            except:
+                st.warning(f"Could not standardize dates for {file_name}.")
+            
+            # Final Xero structure: Date, Amount, Payee, Description, Reference
+            df_xero = pd.DataFrame({
+                'Date': df_final['Date'].fillna(''),
+                'Amount': df_final['Amount'].round(2), 
+                'Payee': '', 
+                'Description': df_final['Description'].astype(str),
+                'Reference': file_name.split('.')[0] 
+            })
+            
+            df_xero.dropna(subset=['Date', 'Amount'], inplace=True)
+            
+            all_df.append(df_xero)
+            
+            st.success(f"Successfully extracted {len(df_xero)} transactions from {file_name}")
 
+    
+    # --- 6. COMBINE AND DOWNLOAD ---
+
+    if all_df:
+        final_combined_df = pd.concat(all_df, ignore_index=True)
         
-        # --- 6. COMBINE AND DOWNLOAD ---
-
-        if all_df:
-            final_combined_df = pd.concat(all_df, ignore_index=True)
-            
-            st.markdown("---")
-            st.subheader("✅ All Transactions Combined and Ready for Download")
-            
-            st.dataframe(final_combined_df)
-            
-            csv_output = final_combined_df.to_csv(index=False, sep=',', encoding='utf-8')
-            st.download_button(
-                label="⬇️ Download Xero Ready CSV File",
-                data=csv_output,
-                file_name="SA_Bank_Statements_Xero_Export.csv",
-                mime="text/csv"
-            )
-
-if __name__ == '__main__':
-    main()
-    main()
+        st.markdown("---")
+        st.subheader("✅ All Transactions Combined and Ready for Download")
+        
+        st.dataframe(final_combined_df)
+        
+        # Convert DataFrame to CSV for download
+        csv_output = final_combined_df.to_csv(index=False, sep=',', encoding='utf-8')
+        st.download_button(
+            label="⬇️ Download Xero Ready CSV File",
+            data=csv_output,
+            file_name="SA_Bank_Statements_Xero_Export.csv",
+            mime="text/csv"
+        )
