@@ -22,7 +22,6 @@ def get_gemini_client():
     try:
         return genai.Client()
     except Exception as e:
-        # Note: This error will only show if the key is present but invalid/malformed
         st.error(f"Error initializing Gemini client: {e}")
         return None
 
@@ -110,22 +109,37 @@ def detect_bank_format(text_content: str) -> str:
             
     return "GENERIC"
 
-
+# *** FIX APPLIED HERE: REVISED clean_value FUNCTION ***
 def clean_value(value):
-    """Cleans numeric values by handling SA (comma for decimal, space/dot for thousands) format."""
-    if not isinstance(value, str): return None
+    """
+    Cleans numeric values by handling SA (comma for decimal, space/dot for thousands) format.
+    Fixes the 2000,00 -> 200000 issue.
+    """
+    if not isinstance(value, str): 
+        return None
         
-    value = str(value).replace('\n', '').replace('\r', '') 
+    value = str(value).strip().replace('\n', '').replace('\r', '') 
+    
+    # 1. Remove currency symbols and merge spaces between digits
+    value = re.sub(r'[R$]', '', value, flags=re.IGNORECASE)
     value = re.sub(r'(\d)\s+(\d)', r'\1\2', value) 
+
+    # 2. Remove thousands separators (dot or space)
+    # Safely remove the dot if it is a thousands separator (e.g., '1.000,00' or '1.000')
+    if re.search(r'\d\.\d{3}(?:,\d{2})?', value):
+        value = value.replace('.', '')
+        
+    # 3. Replace the South African decimal comma with a standard dot
+    value = value.replace(',', '.')
     
-    value = value.replace(' ', '').replace('.', '') 
-    value = value.replace(',', '.') 
+    # 4. Clean up formatting indicators (Dr/Cr)
+    value = value.replace('Cr', '').replace('Dr', '-').strip()
     
-    value = value.replace('Cr', '').replace('Dr', '-').strip() 
-    
+    # 5. Final aggressive cleanup to remove non-numeric/non-dot/non-sign characters
     value = re.sub(r'[^\d\.\-]+', '', value) 
         
     try:
+        # Check if it looks like a number before converting
         if re.match(r'^-?\d*\.?\d+$', value):
             return float(value)
         return None
@@ -150,7 +164,7 @@ def clean_description_for_xero(description):
     
     return description
 
-# --- 3. STANDARDIZATION FUNCTIONS (UNCHANGED) ---
+# --- 3. STANDARDIZATION FUNCTIONS ---
 
 def standardize_fnb(df):
     df.columns = [c.lower().replace(' ', '_') for c in df.columns]
@@ -175,10 +189,8 @@ def standardize_standard(df):
     # Standard Bank uses 6 columns. Check if headers are missing (i.e., column names are integers)
     if 'Debits' not in df.columns and len(df.columns) == 6:
         st.warning("Standard Bank column headers not detected. Applying fixed column names (Details, Service Fee, Debits, Credits, Date, Balance).")
-        # Apply the expected column names based on the defined rule
         df.columns = ["Details", "Service Fee", "Debits", "Credits", "Date", "Balance"]
     
-    # Ensure all required columns are present after potential remapping
     required_cols = ["Details", "Debits", "Credits", "Date"]
     if not all(col in df.columns for col in required_cols):
         raise KeyError(f"Standard Bank parsing failed: Expected columns {required_cols} are not in the extracted DataFrame.")
@@ -211,7 +223,6 @@ def standardize_hbz(df):
     return df[['Date', 'Description', 'Amount']]
 
 def generic_fallback(df):
-    # This is for the pdfplumber generic attempt. The main Gemini fallback is in the core function.
     st.warning("Could not apply specific standardization. CSV will contain raw extracted columns.")
     return df 
 
@@ -228,7 +239,6 @@ def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> pd.DataFr
         return pd.DataFrame()
 
     try:
-        # Create a Part object from the raw PDF bytes
         pdf_part = types.Part.from_bytes(
             data=pdf_file_path.getvalue(),
             mime_type='application/pdf'
@@ -267,7 +277,6 @@ def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> pd.DataFr
 
         import json
         
-        # Clean the response text (sometimes LLMs wrap the JSON in markdown)
         json_text = response.text.strip().strip('```json').strip('```')
         
         data = json.loads(json_text)
@@ -292,13 +301,10 @@ def parse_pdf_data(pdf_file_path, file_name):
     all_transactions = pd.DataFrame()
     bank_name = "GENERIC"
     
-    full_text = ""
-
     try:
         # 1. First attempt: Use pdfplumber for detection and extraction
         with pdfplumber.open(pdf_file_path) as pdf:
             
-            # Detect Bank using simple text extraction
             full_text = " ".join(page.extract_text() for page in pdf.pages if page.extract_text())
             bank_name = detect_bank_format(full_text)
             
@@ -359,7 +365,6 @@ def parse_pdf_data(pdf_file_path, file_name):
         
     # --- PHASE 2: GEMINI FALLBACK (If pdfplumber fails or returns no clean data) ---
     
-    # Reset buffer position for Gemini function
     pdf_file_path.seek(0)
     
     df_gemini = gemini_extract_from_pdf(pdf_file_path, file_name)
@@ -369,14 +374,14 @@ def parse_pdf_data(pdf_file_path, file_name):
         df_gemini['Date'] = df_gemini['Date'].astype(str)
         df_gemini['Description'] = df_gemini['Description'].astype(str)
         
-        # Convert amount to float, ensuring negative debits are preserved
+        # Apply the fixed clean_value to the AI's amount column for safety
         df_gemini['Amount'] = df_gemini['Amount'].apply(lambda x: clean_value(str(x))) 
         df_gemini.dropna(subset=['Amount'], inplace=True)
         
         if not df_gemini.empty:
             return df_gemini[['Date', 'Description', 'Amount']], "AI_EXTRACTED"
         
-    st.error(f"Both pdfplumber and Gemini extraction failed for {file_name}.")
+    st.error(f"Both pdfplumber and Gemini extraction failed for {file_name}. No data extracted.")
     return pd.DataFrame(), "FAILED"
 
 # --- 5. STREAMLIT APP LOGIC ---
