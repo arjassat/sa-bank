@@ -6,13 +6,33 @@ from io import BytesIO
 
 # --- 1. CONFIGURATION AND BANK SPECIFIC RULES ---
 
-# Define parsing rules for South African banks based on common statement layouts.
-# The 'table_settings' are crucial for pdfplumber to accurately find data in each bank's unique layout.
-# Note: These settings are based on the files provided (FNB, ABSA, Standard, HBZ) and may need minor tuning.
-BANK_RULES = {
-    # FNB (Gold Business Account): Single 'Amount' column, +/- sign implied by 'Cr' or 'Dr' in Balance.
+# Strong list-based rules for detection (used by detect_bank_format)
+# Keywords are converted to lowercase for robust, case-insensitive matching.
+BANK_RULES_LIST = [
+    # FNB (Very strong identifier: fnb.co.za or the full bank name)
+    ("FNB", ["fnb.co.za"]),
+    ("FNB", ["first national bank", "account"]),
+    
+    # ABSA (Investment Account is a strong, unique indicator found in the files)
+    ("ABSA", ["absa", "investment account"]),
+    ("ABSA", ["absa", "bank limited", "account"]),
+    
+    # Standard Bank (Covers Private Banking and Business Current)
+    ("STANDARD", ["standard bank", "private banking"]),
+    ("STANDARD", ["standard bank", "current account"]),
+    
+    # HBZ (Unique bank name)
+    ("HBZ", ["hbz bank limited", "account"]),
+    
+    # Nedbank and Capitec (General identifiers for future proofing)
+    ("NEDBANK", ["nedbank limited", "account"]),
+    ("CAPITEC", ["capitec bank", "account"]),
+]
+
+# Map for parsing logic once the bank is detected (used by parse_pdf_data)
+BANK_RULES_MAP = {
+    # FNB: Single 'Amount' column, +/- sign implied by 'Cr' or 'Dr' in Balance.
     "FNB": {
-        "text_search": "Gold Business Account",
         "columns": ["Date", "Description", "Amount", "Balance"],
         "table_settings": {
             "vertical_strategy": "text", 
@@ -21,11 +41,10 @@ BANK_RULES = {
             "snap_y_tolerance": 5,
             "min_words_vertical": 2
         },
-        "parse_func": "parse_fnb"
+        "standardize_func": "standardize_fnb"
     },
-    # Standard Bank (Business Current Account / Private Banking): Debits and Credits are separate columns.
-    "Standard Bank": {
-        "text_search": "CURRENT ACCOUNT",
+    # Standard Bank: Debits and Credits are separate columns.
+    "STANDARD": {
         "columns": ["Details", "Service Fee", "Debits", "Credits", "Date", "Balance"],
         "table_settings": {
             "vertical_strategy": "lines", 
@@ -33,56 +52,80 @@ BANK_RULES = {
             "explicit_vertical_lines": [30, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600],
             "snap_y_tolerance": 3
         },
-        "parse_func": "parse_standard"
+        "standardize_func": "standardize_standard"
     },
-    # ABSA (Investment Account): Transaction amount includes the sign or is complex.
+    # ABSA: Single 'transaction amount R' column.
     "ABSA": {
-        "text_search": "Investment Account",
         "columns": ["date", "transaction amount R", "description", "balance R"],
         "table_settings": {
             "vertical_strategy": "text",
             "explicit_vertical_lines": [30, 80, 400, 550],
             "snap_y_tolerance": 5
         },
-        "parse_func": "parse_absa"
+        "standardize_func": "standardize_absa"
     },
-    # HBZ Bank (Current Account): Debit/Credit columns separate.
-    "HBZ Bank": {
-        "text_search": "HBZ Bank Limited",
+    # HBZ Bank: Debit/Credit columns separate.
+    "HBZ": {
         "columns": ["Date", "Particulars", "Debit", "Credit", "Reference"],
         "table_settings": {
             "vertical_strategy": "lines",
             "snap_y_tolerance": 3
         },
-        "parse_func": "parse_hbz"
+        "standardize_func": "standardize_hbz"
+    },
+    # Default/Generic fallback rule (for Nedbank/Capitec/Unknown)
+    "GENERIC": {
+        "columns": ['Date', 'Description', 'Amount', 'Balance'], 
+        "table_settings": {"vertical_strategy": "lines", "horizontal_strategy": "lines", "snap_tolerance": 5},
+        "standardize_func": "generic_fallback"
     }
-    # Nedbank and Capitec will use the 'Unknown' fallback unless custom rules are added here.
 }
+
 
 # --- 2. HELPER FUNCTIONS ---
 
-def detect_bank(text_content):
-    """Detects the bank based on key phrases in the PDF content."""
-    for bank, rules in BANK_RULES.items():
-        if rules["text_search"] in text_content:
+def detect_bank_format(text_content: str) -> str:
+    """
+    Identifies the bank statement format using robust, case-insensitive keyword matching.
+    Returns the bank name (e.g., "ABSA", "FNB") or "GENERIC" if no bank is identified.
+    """
+    # Convert text to lowercase and normalize multiple spaces/newlines to single space
+    lower_text = re.sub(r'\s+', ' ', text_content.lower())
+
+    for bank, keywords in BANK_RULES_LIST:
+        # Check if ALL required keywords are present in the text
+        if all(keyword in lower_text for keyword in keywords):
             return bank
-    return "Unknown"
+            
+    return "GENERIC"
 
 def clean_value(value):
-    """Cleans numeric values by handling South African (comma for decimal, space/dot for thousands) format."""
+    """Cleans numeric values by handling SA (comma for decimal, space/dot for thousands) format."""
     if not isinstance(value, str):
         return None
         
-    value = value.replace(' ', '').replace('.', '') # Remove thousand separators
-    value = value.replace(',', '.') # Convert comma decimal to dot decimal
-    value = value.replace('Cr', '').replace('Dr', '-').strip() # Handle FNB's Cr/Dr
-    # Clean up broken numbers (e.g., '2\n\n500,00' -> '2500,00')
+    # Standardize and clean up broken numbers (e.g., '2\n\n500,00' -> '2500,00')
+    value = str(value).replace('\n', '').replace('\r', '') 
     value = re.sub(r'(\d)\s+(\d)', r'\1\2', value) 
-    value = re.sub(r'[^\d\.\-]+', '', value) # Keep only numbers, dot, and minus sign
+    
+    # Remove thousand separators (. or space)
+    value = value.replace(' ', '').replace('.', '') 
+    
+    # Convert comma decimal to dot decimal (must be done after removing thousand dots)
+    value = value.replace(',', '.') 
+    
+    # Handle FNB's Cr/Dr and general cleaning
+    value = value.replace('Cr', '').replace('Dr', '-').strip() 
+    
+    # Final cleanup to keep only allowed characters
+    value = re.sub(r'[^\d\.\-]+', '', value) 
         
     try:
-        return float(value)
-    except (ValueError, TypeError):
+        # Check if it's a valid number format before converting
+        if re.match(r'^-?\d*\.?\d+$', value):
+            return float(value)
+        return None
+    except:
         return None
 
 def clean_description_for_xero(description):
@@ -100,10 +143,11 @@ def clean_description_for_xero(description):
     description = re.sub(r'Serial:\d+/\d+', '', description)
 
     # Remove transaction type prefixes
-    description = re.sub(r'(?:POS Purchase|ATM Withdrawal|Immediate Payment|Internet Pmt To|Teller Transfer Debit|Direct Credit|EFT)\s*', '', description, flags=re.IGNORECASE)
+    description = re.sub(r'(?:POS Purchase|ATM Withdrawal|Immediate Payment|Internet Pmt To|Teller Transfer Debit|Direct Credit|EFT|IB Payment)\s*', '', description, flags=re.IGNORECASE)
     
-    # Remove self-references and common suffixes
+    # Remove self-references and common suffixes (like the user's business name)
     description = re.sub(r'\s*-\s*Royal Panelbeaters', '', description, flags=re.IGNORECASE) 
+    
     description = re.sub(r'\s{2,}', ' ', description).strip(' -').strip()
     
     return description
@@ -113,63 +157,80 @@ def clean_description_for_xero(description):
 def standardize_fnb(df):
     """Specific standardization for FNB structure."""
     df.columns = [c.lower().replace(' ', '_') for c in df.columns]
-    # FNB often shows positive for credit and negative for debit, but the 'Cr' in balance is the definitive sign.
-    # We will assume that any transaction line without a clear '-' is a credit, but FNB uses balance columns to flip.
-    # The snippet shows the Amount column is always positive, and the sign is implicit via the balance.
-    # We'll use the presence of 'Dr' in the description or the balance column's implicit sign.
     
     def calculate_fnb_amount(row):
-        amount = clean_value(row['amount'])
-        if not amount: return None
-        # Use the 'Balance' column's associated 'Cr'/'Dr' from the PDF text to determine sign if not in amount.
-        if 'dr' in str(row.get('balance', '')).lower() or '-' in str(row.get('amount', '')):
-            return -abs(amount)
-        return abs(amount)
+        # Extract and clean the numeric amount
+        amount = clean_value(row.get('amount'))
+        if amount is None: return None
+        
+        # Check for debit indicator in the raw amount column or balance column (FNB's convention)
+        is_debit = ('dr' in str(row.get('balance', '')).lower() or 
+                    '-' in str(row.get('amount', '')))
+
+        return -abs(amount) if is_debit else abs(amount)
 
     df['Amount'] = df.apply(calculate_fnb_amount, axis=1)
+    df['Date'] = df['date'].astype(str)
     df['Description'] = df['description'].astype(str)
-    return df
+    return df[['Date', 'Description', 'Amount']]
 
-def standardize_standard_hbz(df, debit_col, credit_col):
-    """Specific standardization for banks with separate Debit/Credit columns (Standard Bank, HBZ)."""
-    df[debit_col] = df[debit_col].apply(clean_value)
-    df[credit_col] = df[credit_col].apply(clean_value)
+def standardize_standard(df):
+    """Specific standardization for Standard Bank (Debit/Credit columns separate)."""
+    df['Debits'] = df['Debits'].apply(clean_value)
+    df['Credits'] = df['Credits'].apply(clean_value)
     
     # Calculate amount: Credit - Debit (Debits should be negative in Xero)
-    df['Amount'] = df[credit_col].fillna(0) - df[debit_col].fillna(0)
+    df['Amount'] = df['Credits'].fillna(0) - df['Debits'].fillna(0)
     
-    # Use the column that holds the main description
-    description_col = 'Details' if 'Details' in df.columns else 'Particulars'
-    df['Description'] = df[description_col].astype(str)
-    
-    return df
+    df['Date'] = df['Date'].astype(str)
+    df['Description'] = df['Details'].astype(str) # 'Details' is the description column
+    return df[['Date', 'Description', 'Amount']]
 
 def standardize_absa(df):
     """Specific standardization for ABSA structure."""
     df.columns = [c.lower().replace(' ', '_') for c in df.columns]
+    
+    # ABSA uses a single 'transaction amount R' column with a negative sign for debits
     df['Amount'] = df['transaction_amount_r'].apply(clean_value)
+    df['Date'] = df['date'].astype(str)
     df['Description'] = df['description'].astype(str)
-    return df
+    return df[['Date', 'Description', 'Amount']]
+    
+def standardize_hbz(df):
+    """Specific standardization for HBZ Bank (Debit/Credit columns separate)."""
+    df['Debit'] = df['Debit'].apply(clean_value)
+    df['Credit'] = df['Credit'].apply(clean_value)
+    
+    # Calculate amount: Credit - Debit (Debits should be negative in Xero)
+    df['Amount'] = df['Credit'].fillna(0) - df['Debit'].fillna(0)
+    
+    df['Date'] = df['Date'].astype(str)
+    df['Description'] = df['Particulars'].astype(str) # 'Particulars' is the description column
+    return df[['Date', 'Description', 'Amount']]
+
+def generic_fallback(df):
+    """Fallback function for unknown banks."""
+    st.warning("Could not apply specific standardization. CSV will contain raw extracted columns.")
+    return df # Return raw dataframe for inspection
 
 # --- 4. CORE EXTRACTION LOGIC ---
 
 def parse_pdf_data(pdf_file_path):
     """Core function to extract tables, detect bank, and standardize the data."""
     all_transactions = pd.DataFrame()
-    bank_name = "Unknown"
+    bank_name = "GENERIC"
 
     try:
         with pdfplumber.open(pdf_file_path) as pdf:
-            # 1. Detect Bank
+            # 1. Detect Bank (using the robust detection logic)
             full_text = " ".join(page.extract_text() for page in pdf.pages if page.extract_text())
-            bank_name = detect_bank(full_text)
+            bank_name = detect_bank_format(full_text)
             
-            if bank_name == "Unknown":
-                st.warning("⚠️ Could not reliably identify the bank statement format (ABSA, FNB, Standard, HBZ, Nedbank, Capitec). Using generic parsing which may fail or produce incorrect results. Please check manually.")
-                # Fallback: Use generic settings (lattice mode for tables)
-                rules = {"columns": ['Date', 'Description', 'Amount', 'Balance'], "table_settings": {"vertical_strategy": "lines", "horizontal_strategy": "lines", "snap_tolerance": 5}}
+            rules = BANK_RULES_MAP[bank_name]
+            
+            if bank_name == "GENERIC":
+                 st.warning("⚠️ Could not reliably identify the bank statement format. Using generic parsing which may fail or produce incorrect results. Please check manually.")
             else:
-                rules = BANK_RULES[bank_name]
                 st.info(f"✅ Detected Bank: **{bank_name}**. Applying custom parsing rules.")
             
             # 2. Extract Data Page by Page
@@ -178,58 +239,56 @@ def parse_pdf_data(pdf_file_path):
                 
                 for table in tables:
                     if table and len(table) > 1:
-                        # Simple header detection logic
                         data_rows = []
-                        if bank_name != "Unknown":
-                            # For known banks, just process data after potential header rows
-                            start_index = 0
-                            for i, row in enumerate(table):
-                                # Skip header rows, which often contain specific titles
-                                if any("BALANCE" in str(cell).upper() for cell in row):
-                                    start_index = i + 1
-                            data_rows = table[start_index:]
-                            
-                            try:
-                                # Apply column names only if the number of columns match
-                                if len(data_rows[0]) == len(rules["columns"]):
-                                    df = pd.DataFrame(data_rows, columns=rules["columns"])
-                                else:
-                                    # Fallback if column count is wrong for custom rule
-                                    df = pd.DataFrame(data_rows)
-                            except:
+                        
+                        # Simple header detection logic to skip header rows
+                        start_index = 0
+                        for i, row in enumerate(table):
+                            if any("BALANCE" in str(cell).upper() for cell in row if cell):
+                                start_index = i + 1
+                                break
+                        data_rows = table[start_index:]
+                        
+                        if not data_rows: continue
+                        
+                        try:
+                            # Apply column names only if the number of columns match
+                            if len(data_rows[0]) == len(rules["columns"]):
+                                df = pd.DataFrame(data_rows, columns=rules["columns"])
+                            else:
+                                # Fallback to no header if column count is wrong
                                 df = pd.DataFrame(data_rows)
-                                
-                        else: # Unknown/Generic/Scanned Fallback
-                            df = pd.DataFrame(table)
+                        except:
+                            df = pd.DataFrame(data_rows)
 
                         all_transactions = pd.concat([all_transactions, df], ignore_index=True)
                             
             # 3. Standardization & Final Formatting
             if not all_transactions.empty:
-                # Remove rows with too few non-NaN values (often junk rows)
+                # Remove rows with too few non-NaN values (often junk rows from PDF margins)
                 all_transactions.dropna(thresh=2, inplace=True)
                 
-                if bank_name == "FNB":
+                # Apply the correct standardization function
+                standardize_func_name = rules["standardize_func"]
+                if standardize_func_name == "standardize_fnb":
                     df_final = standardize_fnb(all_transactions.copy())
-                elif bank_name == "Standard Bank":
-                    df_final = standardize_standard_hbz(all_transactions.copy(), debit_col='Debits', credit_col='Credits')
-                elif bank_name == "ABSA":
+                elif standardize_func_name == "standardize_standard":
+                    df_final = standardize_standard(all_transactions.copy())
+                elif standardize_func_name == "standardize_absa":
                     df_final = standardize_absa(all_transactions.copy())
-                elif bank_name == "HBZ Bank":
-                    df_final = standardize_standard_hbz(all_transactions.copy(), debit_col='Debit', credit_col='Credit')
-                else:
-                    # Generic fallback standardization (requires manual mapping which is too complex here)
-                    st.warning("Cannot standardize data for unknown bank. CSV will contain raw extracted columns.")
-                    return all_transactions.copy(), bank_name # Return raw for inspection
+                elif standardize_func_name == "standardize_hbz":
+                    df_final = standardize_hbz(all_transactions.copy())
+                else: # GENERIC FALLBACK
+                    return generic_fallback(all_transactions.copy()), bank_name
                 
                 # Final filtering and column selection for the standardized result
-                df_final = df_final[df_final['Amount'].notna()]
+                df_final.dropna(subset=['Amount'], inplace=True)
                 
                 return df_final, bank_name
 
     except Exception as e:
-        st.error(f"An error occurred during PDF processing: {e}")
-        st.info("This often happens when `pdfplumber` cannot find text layers (i.e., it's a scanned image) or the PDF is malformed.")
+        st.error(f"An error occurred during PDF processing. Error: {e}")
+        st.info("This often happens when `pdfplumber` cannot find a text layer (i.e., it's a scanned image) or the PDF is malformed.")
         return pd.DataFrame(), bank_name
     
     return pd.DataFrame(), bank_name
@@ -241,15 +300,15 @@ def main():
 
     st.title("🇿🇦 SA Bank Statement PDF to Xero CSV Converter")
     st.markdown("""
-        ### Build by Gemini AI: Free, easy-to-use tool for South African bank statement conversion.
+        ### Built by Gemini AI for accountants: Free, easy-to-use tool for South African bank statement conversion.
         This app uses **Python/pdfplumber** to extract transactions from **native (text-based) PDF** statements and format them for upload into **Xero**. 
         
-        **Supported Banks (with custom rules): ABSA, FNB, Standard Bank, HBZ** (and all others via generic parsing).
+        **Supported Banks (with custom rules): ABSA, FNB, Standard Bank, HBZ.**
         
-        **⚠️ Important Note on Scanned Documents & Free Service (The AI part):**
-        * Extracting tables accurately from **scanned or image-based PDFs** requires advanced, proprietary **OCR (Optical Character Recognition) and AI models**.
-        * A **completely free** solution like this **cannot guarantee reliable extraction** from scanned/image files. It will attempt it, but results may be inaccurate or empty.
-        * This tool is best suited for **digital, native PDFs** from your bank.
+        **⚠️ Important Note on Scanned Documents & Free Service:**
+        * Extracting data from **scanned or image-based PDFs** requires advanced, proprietary **OCR/AI services** (which are not free).
+        * This tool uses the best **free, open-source** method. It will attempt to process scanned files, but accuracy is **not guaranteed**.
+        * It is best suited for **digital, native PDFs** downloaded directly from your bank.
         ---
     """)
 
@@ -296,9 +355,8 @@ def main():
                 # Final Xero structure: Date, Amount, Payee, Description, Reference
                 df_xero = pd.DataFrame({
                     'Date': df_final['Date'].fillna(''),
-                    # Amount is critical and must be correct. Xero accepts positive for money in, negative for money out.
                     'Amount': df_final['Amount'].round(2), 
-                    'Payee': '', # Can be mapped manually in Xero
+                    'Payee': '', # Leave blank for manual mapping in Xero
                     'Description': df_final['Description'].astype(str),
                     'Reference': file_name.split('.')[0] # Use file name as a default reference
                 })
@@ -318,6 +376,8 @@ def main():
             
             st.markdown("---")
             st.subheader("✅ All Transactions Combined and Ready for Download")
+            
+            # Display the final, clean dataframe
             st.dataframe(final_combined_df)
             
             # Create the Xero CSV file
@@ -328,6 +388,9 @@ def main():
                 file_name="SA_Bank_Statements_Xero_Export.csv",
                 mime="text/csv"
             )
+
+if __name__ == '__main__':
+    main()
 
 if __name__ == '__main__':
     main()
