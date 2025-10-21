@@ -109,7 +109,6 @@ def detect_bank_format(text_content: str) -> str:
             
     return "GENERIC"
 
-# *** FIX APPLIED HERE: REVISED clean_value FUNCTION ***
 def clean_value(value):
     """
     Cleans numeric values by handling SA (comma for decimal, space/dot for thousands) format.
@@ -391,7 +390,7 @@ if 'uploaded_files' not in st.session_state:
 
 st.set_page_config(page_title="🇿🇦 Free SA Bank Statement to Xero CSV Converter", layout="wide")
 
-st.title("🇿🇦 SA Bank Statement PDF to Xero CSV Converter")
+st.title("🇿🇦 SA Bank Statement PDF to CSV Converter")
 st.markdown("""
     ### Built with Gemini AI for accountants: Free, robust tool for South African bank statement conversion.
     
@@ -444,14 +443,15 @@ if uploaded_files:
             except Exception as e:
                 st.warning(f"Could not standardize dates for {file_name}. Dates remain in raw format. Error: {e}")
             
-            # Final Xero structure: Date, Amount, Payee, Description, Reference
+            # *** FIX APPLIED HERE: ONLY include Date, Description, and Amount ***
             df_xero = pd.DataFrame({
                 'Date': df_final['Date'].fillna(''),
-                'Amount': df_final['Amount'].round(2), 
-                'Payee': '', 
                 'Description': df_final['Description'].astype(str),
-                'Reference': file_name.split('.')[0] 
+                'Amount': df_final['Amount'].round(2), 
             })
+            
+            # Ensure the order is exactly Date, Description, Amount
+            df_xero = df_xero[['Date', 'Description', 'Amount']]
             
             df_xero.dropna(subset=['Date', 'Amount'], inplace=True)
             
@@ -473,8 +473,8 @@ if uploaded_files:
         # Convert DataFrame to CSV for download
         csv_output = final_combined_df.to_csv(index=False, sep=',', encoding='utf-8')
         st.download_button(
-            label="⬇️ Download Xero Ready CSV File",
+            label="⬇️ Download Bank Statement CSV File",
             data=csv_output,
-            file_name="SA_Bank_Statements_Xero_Export.csv",
+            file_name="SA_Bank_Statements_Export.csv",
             mime="text/csv"
         )
