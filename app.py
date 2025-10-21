@@ -21,7 +21,6 @@ def get_gemini_client():
     try:
         return genai.Client()
     except Exception as e:
-        # Note: This error will only show if the key is present but invalid/malformed
         st.error(f"Error initializing Gemini client: {e}")
         return None
 
@@ -97,7 +96,7 @@ BANK_RULES_MAP = {
 }
 
 
-# --- 2. HELPER FUNCTIONS (UNCHANGED) ---
+# --- 2. HELPER FUNCTIONS ---
 
 def detect_bank_format(text_content: str) -> str:
     """
@@ -192,7 +191,7 @@ def clean_description_for_xero(description):
     
     return description
 
-# --- 3. STANDARDIZATION FUNCTIONS (UNCHANGED) ---
+# --- 3. STANDARDIZATION FUNCTIONS ---
 
 def standardize_fnb(df):
     df.columns = [c.lower().replace(' ', '_') for c in df.columns]
@@ -210,6 +209,25 @@ def standardize_fnb(df):
     return df[['Date', 'Description', 'Amount']]
 
 def standardize_standard(df):
+    """
+    UPDATED: Robustly remaps and cleans columns for Standard Bank.
+    The Standard Bank format uses: Details, Service Fee, Debits, Credits, Date, Balance.
+    pdfplumber often extracts headers as [Details, Service Fee, Debits, Credits, Date, Balance]
+    but sometimes gets them as [0, 1, 2, 3, 4, 5] if the row extraction misses the header.
+    We check for the missing column and apply the expected column names if necessary.
+    """
+    
+    # Standard Bank uses 6 columns. Check if headers are missing (i.e., column names are integers)
+    if 'Debits' not in df.columns and len(df.columns) == 6:
+        st.warning("Standard Bank column headers not detected. Applying fixed column names (Details, Service Fee, Debits, Credits, Date, Balance).")
+        # Apply the expected column names based on the defined rule
+        df.columns = ["Details", "Service Fee", "Debits", "Credits", "Date", "Balance"]
+    
+    # Ensure all required columns are present after potential remapping
+    required_cols = ["Details", "Debits", "Credits", "Date"]
+    if not all(col in df.columns for col in required_cols):
+        raise KeyError(f"Standard Bank parsing failed: Expected columns {required_cols} are not in the extracted DataFrame.")
+        
     df['Debits'] = df['Debits'].apply(clean_value)
     df['Credits'] = df['Credits'].apply(clean_value)
     
@@ -242,7 +260,7 @@ def generic_fallback(df):
     return df 
 
 
-# --- 4. CORE EXTRACTION LOGIC (UNCHANGED) ---
+# --- 4. CORE EXTRACTION LOGIC ---
 
 def parse_pdf_data(pdf_file_path, file_name):
     """Core function to extract tables, detect bank, and standardize the data."""
@@ -277,8 +295,9 @@ def parse_pdf_data(pdf_file_path, file_name):
                     if table and len(table) > 1:
                         # Skip header rows
                         start_index = 0
+                        # Standard Bank sometimes has "Balance" split over two lines, so use "BAL"
                         for i, row in enumerate(table):
-                            if any("BALANCE" in str(cell).upper() for cell in row if cell):
+                            if any("BAL" in str(cell).upper() for cell in row if cell):
                                 start_index = i + 1
                                 break
                         data_rows = table[start_index:]
@@ -286,10 +305,10 @@ def parse_pdf_data(pdf_file_path, file_name):
                         if not data_rows: continue
                         
                         try:
-                            if len(data_rows[0]) == len(rules["columns"]):
-                                df = pd.DataFrame(data_rows, columns=rules["columns"])
-                            else:
-                                df = pd.DataFrame(data_rows)
+                            # Use detected column names from rules if the table has the correct number of columns
+                            # NOTE: We skip assigning column names here to let the standardize function handle 
+                            # the naming/remapping more flexibly, which is safer.
+                            df = pd.DataFrame(data_rows)
                         except:
                             df = pd.DataFrame(data_rows)
 
@@ -316,19 +335,18 @@ def parse_pdf_data(pdf_file_path, file_name):
                 return df_final, bank_name
 
     except Exception as e:
+        # Improved error message to help with column key debugging
         st.error(f"An error occurred during PDF processing for {file_name}. Error: {e}")
-        st.info("This often happens when `pdfplumber` cannot find a text layer (i.e., it's a scanned image) or the PDF is malformed.")
+        st.info("This often happens when `pdfplumber` cannot find a text layer (i.e., it's a scanned image) or the PDF is malformed, OR if the required column names for a detected bank (e.g., 'Debits') were not extracted properly.")
         return pd.DataFrame(), bank_name
     
     return pd.DataFrame(), bank_name
 
-# --- 5. STREAMLIT APP LOGIC (UPDATED) ---
+# --- 5. STREAMLIT APP LOGIC ---
 
-# Initialize session state for file uploader
 if 'uploaded_files' not in st.session_state:
     st.session_state['uploaded_files'] = []
 
-# --- APP LAYOUT (MAIN EXECUTION BLOCK) ---
 st.set_page_config(page_title="🇿🇦 Free SA Bank Statement to Xero CSV Converter", layout="wide")
 
 st.title("🇿🇦 SA Bank Statement PDF to Xero CSV Converter")
@@ -339,15 +357,12 @@ st.markdown("""
     ---
 """)
 
-# Check if AI client is initialized and inform the user
 if client:
     st.sidebar.success("Gemini AI Analysis: **Active** ✅")
 else:
     st.sidebar.warning("Gemini AI Analysis: **Inactive** 🛑. Please set **GEMINI_API_KEY** in Streamlit Secrets.")
 
 
-# **FIXED DUPLICATE KEY ERROR**: This widget is now placed in the main execution flow 
-# and uses session state to ensure stability.
 uploaded_files = st.file_uploader(
     "Upload your bank statement PDF files (Multiple files supported)",
     type=["pdf"],
@@ -380,7 +395,6 @@ if uploaded_files:
             })
             
             try:
-                # Attempt to parse date in SA format (day/month/year)
                 df_final['Date'] = pd.to_datetime(df_final['Date'], errors='coerce', dayfirst=True).dt.strftime('%d/%m/%Y')
             except:
                 st.warning(f"Could not standardize dates for {file_name}.")
@@ -411,7 +425,6 @@ if uploaded_files:
         
         st.dataframe(final_combined_df)
         
-        # Convert DataFrame to CSV for download
         csv_output = final_combined_df.to_csv(index=False, sep=',', encoding='utf-8')
         st.download_button(
             label="⬇️ Download Xero Ready CSV File",
