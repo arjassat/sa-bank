@@ -1,3 +1,5 @@
 streamlit
 pandas
 pdfplumber
+google-genai 
+# Add any other required libraries (e.g., cffi, etc.)
