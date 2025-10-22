@@ -1,10 +1,9 @@
 import streamlit as st
 import pandas as pd
-import pdfplumber
+# pdfplumber is no longer required
 import re
 from io import BytesIO
 import os
-import numpy as np
 
 # --- AI INTEGRATION SETUP ---
 from google import genai
@@ -30,100 +29,17 @@ client = get_gemini_client()
 # --- END AI INTEGRATION SETUP ---
 
 
-# --- 1. CONFIGURATION AND BANK SPECIFIC RULES ---
-
-# Strong list-based rules for detection (used by detect_bank_format)
-BANK_RULES_LIST = [
-    ("NEDBANK", ["nedbank", "current account"]), # New Nedbank rule
-    ("FNB", ["fnb.co.za"]),
-    ("FNB", ["first national bank", "account"]),
-    
-    ("ABSA", ["absa", "investment account"]),
-    ("ABSA", ["absa", "bank limited", "account"]),
-    
-    ("STANDARD", ["standard bank", "private banking"]),
-    ("STANDARD", ["standard bank", "current account"]),
-    
-    ("HBZ", ["hbz bank limited", "account"]),
-    ("CAPITEC", ["capitec bank", "account"]),
-]
-
-# Map for parsing logic once the bank is detected (used by parse_pdf_data)
-BANK_RULES_MAP = {
-    "NEDBANK": {
-        # Columns: Date, Description, Fee, Amount, Reference, Balance
-        "columns": ["Date", "Description", "Fee", "Amount", "Reference", "Balance"], 
-        "table_settings": {
-            "vertical_strategy": "lines", 
-            "horizontal_strategy": "text",
-            "snap_y_tolerance": 3
-        },
-        "standardize_func": "standardize_nedbank"
-    },
-    "FNB": {
-        "columns": ["Date", "Description", "Amount", "Balance"],
-        "table_settings": {
-            "vertical_strategy": "text", 
-            "horizontal_strategy": "text",
-            "explicit_vertical_lines": [30, 80, 480, 540],
-            "snap_y_tolerance": 5,
-            "min_words_vertical": 2
-        },
-        "standardize_func": "standardize_fnb"
-    },
-    "STANDARD": {
-        "columns": ["Details", "Service Fee", "Debits", "Credits", "Date", "Balance"],
-        "table_settings": {
-            "vertical_strategy": "lines", 
-            "horizontal_strategy": "text",
-            "explicit_vertical_lines": [30, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600],
-            "snap_y_tolerance": 3
-        },
-        "standardize_func": "standardize_standard"
-    },
-    "ABSA": {
-        "columns": ["date", "transaction amount R", "description", "balance R"],
-        "table_settings": {
-            "vertical_strategy": "text",
-            "explicit_vertical_lines": [30, 80, 400, 550],
-            "snap_y_tolerance": 5
-        },
-        "standardize_func": "standardize_absa"
-    },
-    "HBZ": {
-        "columns": ["Date", "Particulars", "Debit", "Credit", "Reference"],
-        "table_settings": {
-            "vertical_strategy": "lines",
-            "snap_y_tolerance": 3
-        },
-        "standardize_func": "standardize_hbz"
-    },
-    # Default/Generic fallback rule for unknown banks
-    "GENERIC": {
-        "columns": ['Date', 'Description', 'Amount', 'Balance'], 
-        "table_settings": {"vertical_strategy": "lines", "horizontal_strategy": "lines", "snap_tolerance": 5},
-        "standardize_func": "generic_fallback"
-    }
-}
-
-
 # --- 2. HELPER FUNCTIONS ---
-
-def detect_bank_format(text_content: str) -> str:
-    """Identifies the bank statement format using robust, case-insensitive keyword matching."""
-    lower_text = re.sub(r'\s+', ' ', text_content.lower())
-
-    for bank, keywords in BANK_RULES_LIST:
-        if all(keyword in lower_text for keyword in keywords):
-            return bank
-            
-    return "GENERIC"
 
 def clean_value(value):
     """
     Cleans numeric values by handling SA (comma for decimal, space/dot for thousands) format.
+    Kept as a safety net for the AI's JSON output.
     """
     if not isinstance(value, str): 
+        # Handle direct float/int from AI's JSON output
+        if isinstance(value, (int, float)):
+            return float(value)
         return None
         
     value = str(value).strip().replace('\n', '').replace('\r', '') 
@@ -132,11 +48,12 @@ def clean_value(value):
     value = re.sub(r'[R$]', '', value, flags=re.IGNORECASE)
     value = re.sub(r'(\d)\s+(\d)', r'\1\2', value) 
 
-    # 2. Remove thousands separators (dot or space)
-    # This prevents '1.000,00' from becoming '1000.00' if it's actually '1.00'
-    if re.search(r'\d\.\d{3}(?:,\d{2})?', value):
-        value = value.replace('.', '')
-        
+    # 2. Handle South African formatting (1 000,00 or 1.000,00)
+    if ',' in value:
+        value = value.replace('.', '').replace(' ', '')
+    else: # Handle standard dot-as-decimal format if no comma is present
+        value = value.replace(' ', '')
+
     # 3. Replace the South African decimal comma with a standard dot
     value = value.replace(',', '.')
     
@@ -147,7 +64,6 @@ def clean_value(value):
     value = re.sub(r'[^\d\.\-]+', '', value) 
         
     try:
-        # Check if it looks like a number before converting
         if re.match(r'^-?\d*\.?\d+$', value):
             return float(value)
         return None
@@ -172,187 +88,16 @@ def clean_description_for_xero(description):
     
     return description
 
-# --- 3. STANDARDIZATION FUNCTIONS (FEE FILTERING LOGIC) ---
-
-def standardize_nedbank(df):
-    """
-    FIXED: Nedbank - Hard-selects columns [0, 1, 3] to explicitly skip the fee column (index 2).
-    """
-    
-    num_cols = df.shape[1]
-    
-    if num_cols >= 6:
-        # Typical 6-column Nedbank layout: [Date (0), Description (1), Fee (2), Amount (3), Ref/Empty (4), Balance (5)]
-        st.info("Nedbank: Detected 6+ columns. **Explicitly selecting [0, 1, 3] to skip Fee column (2).**")
-        df_base = df.iloc[:, [0, 1, 3]].copy()
-    elif num_cols >= 4: # Handle 4 or 5 column variations
-        st.warning(f"Nedbank: Detected {num_cols} columns (unusual). Assuming Fee column was not extracted and taking first 3.")
-        df_base = df.iloc[:, :3].copy()
-    else: # Less than 4 columns (Extraction failure)
-        st.error(f"Nedbank standardization failed: Too few columns ({num_cols}).")
-        return pd.DataFrame()
-        
-    # 2. Rename and Clean
-    if df_base.shape[1] == 3:
-        df_base.columns = ['Date', 'Description', 'Amount_Raw']
-        
-        # 3. Calculate signed amount
-        df_base['Amount'] = df_base['Amount_Raw'].apply(clean_value)
-    else:
-        st.error("Nedbank standardization failed: Final column count is not 3 after filtering.")
-        return pd.DataFrame()
-    
-    # 4. Final Standardization
-    df_base['Date'] = df_base['Date'].astype(str)
-    df_base['Description'] = df_base['Description'].astype(str)
-    
-    # Final cleanup to remove rows where the amount is effectively zero
-    df_base = df_base[df_base['Amount'].abs().fillna(0) > 0.01] 
-    
-    return df_base[['Date', 'Description', 'Amount']]
-
-def standardize_fnb(df):
-    """
-    FNB: Subtracts the 'Accrued Bank Charges' column value from the 'Amount' column
-    to get the correct base transaction value, without filtering the row.
-    """
-    # Normalize columns
-    new_columns = []
-    for col in df.columns:
-        if isinstance(col, str):
-            col = col.replace('\n', ' ').replace('\r', ' ').strip()
-            col = re.sub(r'\s{2,}', ' ', col)
-            col = col.lower().replace(' ', '_')
-        new_columns.append(col)
-    df.columns = new_columns
-
-    amount_col = 'amount'
-    date_col = 'date'
-    description_col = 'description'
-    accrued_fees_col = None
-    
-    # 1. Identify the accrued fee column
-    for col in df.columns:
-        if 'accrued_bank_charges' in col or 'accrued_bank_charge' in col:
-            accrued_fees_col = col
-            break
-            
-    # Clean the primary amount column and create a base amount column
-    df['Base_Amount'] = df[amount_col].apply(clean_value)
-    
-    # 2. FEE ADJUSTMENT
-    if accrued_fees_col and amount_col in df.columns:
-        st.info("FNB: Adjusting 'Amount' by subtracting 'Accrued Bank Charges' to get base transaction.")
-        df[accrued_fees_col] = df[accrued_fees_col].apply(clean_value)
-        fee_magnitude = abs(df[accrued_fees_col].fillna(0))
-        
-        # Apply subtraction only where a fee was present (fee_magnitude > 0)
-        adjustment_mask = (df[accrued_fees_col].notna()) & (fee_magnitude > 0)
-        df.loc[adjustment_mask, 'Base_Amount'] = df.loc[adjustment_mask, 'Base_Amount'] - fee_magnitude.loc[adjustment_mask]
-
-    
-    # 3. CALCULATE SIGNED FINAL AMOUNT
-    def calculate_fnb_signed_amount(row):
-        amount = row.get('Base_Amount')
-        if amount is None or abs(amount) < 0.01: return 0.0
-        
-        # Find the balance column to check for 'Cr'
-        balance_col = None
-        for col in df.columns:
-             if 'balance' in col:
-                balance_col = col
-                break
-        
-        # If 'Cr' is in the balance column text, it's a Credit (positive).
-        if balance_col and 'cr' in str(row.get(balance_col, '')).lower():
-            return abs(amount)
-        # Otherwise, it's a Debit (negative).
-        return -abs(amount)
-
-    df['Amount'] = df.apply(calculate_fnb_signed_amount, axis=1)
-    
-    # 4. FINAL STANDARDIZATION
-    df['Date'] = df[date_col].astype(str)
-    df['Description'] = df[description_col].astype(str)
-    
-    df = df[df['Amount'].abs().fillna(0) > 0.01] 
-    
-    return df[['Date', 'Description', 'Amount']]
-
-def standardize_standard(df):
-    """
-    Standard Bank: Subtracts the Service Fee from Debits/Credits, but keeps the resulting base transaction line.
-    """
-    
-    # 1. Column Header Check/Remapping
-    if 'Debits' not in df.columns and len(df.columns) == 6:
-        st.warning("Standard Bank column headers not detected. Applying fixed column names...")
-        df.columns = ["Details", "Service Fee", "Debits", "Credits", "Date", "Balance"]
-    
-    required_cols = ["Details", "Debits", "Credits", "Date", "Service Fee"] 
-    if not all(col in df.columns for col in required_cols):
-        raise KeyError(f"Standard Bank parsing failed: Expected columns {required_cols} are not in the extracted DataFrame.")
-        
-    # 2. Clean values
-    df['Debits'] = df['Debits'].apply(clean_value)
-    df['Credits'] = df['Credits'].apply(clean_value)
-    df['Service Fee'] = df['Service Fee'].apply(clean_value)
-    
-    # 3. FEE ADJUSTMENT: Subtract the fee from the Debit/Credit amount on lines where it is co-located
-    fee_magnitude = abs(df['Service Fee'].fillna(0))
-    
-    # Adjust Debits:
-    debit_fee_mask = (df['Service Fee'].notna() & df['Debits'].notna())
-    df.loc[debit_fee_mask, 'Debits'] = df.loc[debit_fee_mask, 'Debits'] - fee_magnitude.loc[debit_fee_mask]
-
-    # Adjust Credits (less common):
-    credit_fee_mask = (df['Service Fee'].notna() & df['Credits'].notna())
-    df.loc[credit_fee_mask, 'Credits'] = df.loc[credit_fee_mask, 'Credits'] - fee_magnitude.loc[credit_fee_mask]
-        
-    # 4. Recalculate Amount after fee removal
-    df['Amount'] = df['Credits'].fillna(0) - df['Debits'].fillna(0)
-    
-    # 5. Final Standardization
-    df['Date'] = df['Date'].astype(str)
-    df['Description'] = df['Details'].astype(str)
-    
-    # Final cleanup to remove rows where the amount is effectively zero
-    df = df[df['Amount'].abs().fillna(0) > 0.01] 
-    
-    return df[['Date', 'Description', 'Amount']]
-
-def standardize_absa(df):
-    df.columns = [c.lower().replace(' ', '_') for c in df.columns]
-    
-    df['Amount'] = df['transaction_amount_r'].apply(clean_value)
-    df['Date'] = df['date'].astype(str)
-    df['Description'] = df['description'].astype(str)
-    
-    return df[['Date', 'Description', 'Amount']]
-    
-def standardize_hbz(df):
-    df['Debit'] = df['Debit'].apply(clean_value)
-    df['Credit'] = df['Credit'].apply(clean_value)
-    
-    df['Amount'] = df['Credit'].fillna(0) - df['Debit'].fillna(0)
-    df['Date'] = df['Date'].astype(str)
-    df['Description'] = df['Particulars'].astype(str)
-    
-    return df[['Date', 'Description', 'Amount']]
-
-def generic_fallback(df):
-    st.warning("Could not apply specific standardization. CSV will contain raw extracted columns.")
-    return df 
-
-# --- 4. CORE EXTRACTION LOGIC (GEMINI PROMPT KEPT NEUTRAL) ---
+# --- 4. CORE EXTRACTION LOGIC (GEMINI ONLY) ---
 
 def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> pd.DataFrame:
     """
-    FALLBACK: Uses Gemini's vision capability for extraction.
+    PRIMARY METHOD: Uses Gemini's vision capability for extraction based on strict JSON rules.
+    This function's prompt is designed to separate main transactions and fees.
     """
-    st.info("🔄 **Initiating Gemini OCR/Extraction Fallback...** (This may take a moment)")
+    st.info("🔄 **Initiating Gemini AI Extraction...** (This may take a moment)")
     if not client:
-        st.error("Gemini client is inactive. Cannot run OCR fallback.")
+        st.error("Gemini client is inactive. Cannot run AI extraction.")
         return pd.DataFrame()
 
     try:
@@ -403,7 +148,7 @@ def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> pd.DataFr
         data = json.loads(json_text)
         
         if isinstance(data, list) and data:
-            st.success(f"Gemini Fallback successful! Extracted {len(data)} transactions.")
+            st.success(f"Gemini AI Extraction successful! Extracted {len(data)} transactions.")
             return pd.DataFrame(data)
         else:
             st.error("Gemini extracted a result, but it was empty or not a valid list of transactions.")
@@ -413,119 +158,61 @@ def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> pd.DataFr
         st.error(f"Gemini API Error: {e}. Check your API key or contact support.")
         return pd.DataFrame()
     except Exception as e:
-        st.error(f"Gemini Fallback failed due to an unexpected error. Error: {e}")
+        st.error(f"Gemini AI Extraction failed due to an unexpected error. Error: {e}")
         return pd.DataFrame()
 
 
 def parse_pdf_data(pdf_file_path, file_name):
-    """Core function to extract tables, detect bank, and standardize the data."""
-    all_transactions = pd.DataFrame()
-    bank_name = "GENERIC"
+    """
+    Modified core function: Now uses only Gemini AI for extraction.
+    This enforces the desired output format of separated fees.
+    """
     
-    try:
-        # 1. First attempt: Use pdfplumber for detection and extraction
-        with pdfplumber.open(pdf_file_path) as pdf:
-            
-            full_text = " ".join(page.extract_text() for page in pdf.pages if page.extract_text())
-            bank_name = detect_bank_format(full_text)
-            
-            rules = BANK_RULES_MAP.get(bank_name, BANK_RULES_MAP["GENERIC"])
-
-            if bank_name == "GENERIC":
-                st.warning("⚠️ Could not reliably identify the bank statement format.")
-            else:
-                st.info(f"✅ Detected Bank: **{bank_name}**. Applying custom parsing rules.")
-            
-            
-            # 2. Extract Data Page by Page using pdfplumber's rules
-            for page in pdf.pages:
-                tables = page.extract_tables(rules["table_settings"])
-                
-                for table in tables:
-                    if table and len(table) > 1:
-                        # Skip header rows
-                        start_index = 0
-                        for i, row in enumerate(table):
-                            if any("BAL" in str(cell).upper() for cell in row if cell) or \
-                               any("AMOUNT" in str(cell).upper() for cell in row if cell):
-                                start_index = i + 1
-                                break
-                        data_rows = table[start_index:]
-                        
-                        if not data_rows: continue
-                        
-                        df = pd.DataFrame(data_rows)
-                        all_transactions = pd.concat([all_transactions, df], ignore_index=True)
-                            
-        # 3. Standardization & Final Formatting (Only if pdfplumber found data)
-        if not all_transactions.empty:
-            all_transactions.dropna(thresh=2, inplace=True)
-            
-            standardize_func_name = rules["standardize_func"]
-            if standardize_func_name == "standardize_nedbank":
-                df_final = standardize_nedbank(all_transactions.copy())
-            elif standardize_func_name == "standardize_fnb":
-                df_final = standardize_fnb(all_transactions.copy())
-            elif standardize_func_name == "standardize_standard":
-                df_final = standardize_standard(all_transactions.copy())
-            elif standardize_func_name == "standardize_absa":
-                df_final = standardize_absa(all_transactions.copy())
-            elif standardize_func_name == "standardize_hbz":
-                df_final = standardize_hbz(all_transactions.copy())
-            else: 
-                df_final = generic_fallback(all_transactions.copy())
-                
-            df_final.dropna(subset=['Amount'], inplace=True)
-            
-            if not df_final.empty:
-                st.success("pdfplumber extracted transactions successfully.")
-                return df_final, bank_name
-            else:
-                st.warning("pdfplumber extracted data but standardization failed. Falling back to Gemini.")
-
-    except Exception as e:
-        st.warning(f"pdfplumber failed for {file_name}. Reason: '{e}'. Trying Gemini fallback...")
-        
-    # --- PHASE 2: GEMINI FALLBACK (If pdfplumber fails or returns no clean data) ---
+    pdf_file_path.seek(0) # Ensure the file pointer is at the beginning
     
-    pdf_file_path.seek(0)
-    
+    # --- PHASE 1: GEMINI EXTRACTION (Now the sole method) ---
     df_gemini = gemini_extract_from_pdf(pdf_file_path, file_name)
     
     if not df_gemini.empty:
-        # Standardize the Gemini-extracted DataFrame to ensure consistent column names
+        # Standardization and cleaning steps
+        required_cols = ['Date', 'Description', 'Amount']
+        if not all(col in df_gemini.columns for col in required_cols):
+             st.error("AI output is missing required columns (Date, Description, Amount).")
+             return pd.DataFrame(), "FAILED"
+
         df_gemini['Date'] = df_gemini['Date'].astype(str)
         df_gemini['Description'] = df_gemini['Description'].astype(str)
         
         # Apply the fixed clean_value to the AI's amount column for safety
-        df_gemini['Amount'] = df_gemini['Amount'].apply(lambda x: clean_value(str(x))) 
+        df_gemini['Amount'] = df_gemini['Amount'].apply(lambda x: clean_value(x)) 
         df_gemini.dropna(subset=['Amount'], inplace=True)
         
         if not df_gemini.empty:
-            return df_gemini[['Date', 'Description', 'Amount']], "AI_EXTRACTED"
-        
-    st.error(f"Both pdfplumber and Gemini extraction failed for {file_name}. No data extracted.")
+            return df_gemini[['Date', 'Description', 'Amount']], "AI_ONLY"
+
+    st.error(f"Gemini AI extraction failed for {file_name}. No data extracted.")
     return pd.DataFrame(), "FAILED"
+
 
 # --- 5. STREAMLIT APP LOGIC ---
 
 if 'uploaded_files' not in st.session_state:
     st.session_state['uploaded_files'] = []
 
-st.set_page_config(page_title="🇿🇦 Free SA Bank Statement to CSV Converter", layout="wide")
+st.set_page_config(page_title="🇿🇦 Free SA Bank Statement to CSV Converter (AI Only)", layout="wide")
 
-st.title("🇿🇦 SA Bank Statement PDF to CSV Converter")
+st.title("🇿🇦 SA Bank Statement PDF to CSV Converter (AI-Only)")
 st.markdown("""
-    ### Built with Gemini AI for accountants: Free, robust tool for South African bank statement conversion.
+    ### Now using **Gemini AI exclusively** for robust extraction and separate fee line items.
     
-    **Supported Banks (with custom rules): Nedbank, ABSA, FNB, Standard Bank, HBZ.** Uses **Gemini AI** as a powerful **fallback** for **scanned or difficult PDFs**.
+    This version skips the PDF table parsing to ensure **all transactions and bank fees are captured on separate lines** for easier Xero/accounting reconciliation.
     ---
 """)
 
 if client:
-    st.sidebar.success("Gemini AI Fallback/OCR: **Active** ✅")
+    st.sidebar.success("Gemini AI Engine: **Active** ✅ (Exclusive Use)")
 else:
-    st.sidebar.warning("Gemini AI Fallback/OCR: **Inactive** 🛑. Please set **GEMINI_API_KEY** in Streamlit Secrets.")
+    st.sidebar.warning("Gemini AI Engine: **Inactive** 🛑. Please set **GEMINI_API_KEY** in Streamlit Secrets.")
 
 
 uploaded_files = st.file_uploader(
@@ -547,8 +234,8 @@ if uploaded_files:
         
         pdf_data = BytesIO(uploaded_file.read())
         
-        # CORE CALL: attempts pdfplumber first, then falls back to Gemini
-        df_transactions, bank_name = parse_pdf_data(pdf_data, file_name)
+        # CORE CALL: Now exclusively uses the AI logic
+        df_transactions, source = parse_pdf_data(pdf_data, file_name)
 
         if not df_transactions.empty and 'Amount' in df_transactions.columns:
             
@@ -561,8 +248,6 @@ if uploaded_files:
                 'Amount': 'Amount'
             })
             
-            # *** NO GLOBAL FEE FILTERING IS APPLIED HERE ***
-
             try:
                 # Attempt to parse date in SA format (day/month/year)
                 df_final['Date'] = pd.to_datetime(df_final['Date'], errors='coerce', dayfirst=True).dt.strftime('%d/%m/%Y')
@@ -583,7 +268,7 @@ if uploaded_files:
             
             all_df.append(df_xero)
             
-            st.success(f"Successfully extracted {len(df_xero)} transactions from {file_name}")
+            st.success(f"Successfully extracted {len(df_xero)} transactions from {file_name} using **Gemini AI**.")
 
     
     # --- 6. COMBINE AND DOWNLOAD ---
@@ -601,6 +286,6 @@ if uploaded_files:
         st.download_button(
             label="⬇️ Download Bank Statement CSV File",
             data=csv_output,
-            file_name="SA_Bank_Statements_Export.csv",
+            file_name="SA_Bank_Statements_AI_Export.csv",
             mime="text/csv"
         )
