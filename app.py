@@ -112,7 +112,6 @@ def detect_bank_format(text_content: str) -> str:
 def clean_value(value):
     """
     Cleans numeric values by handling SA (comma for decimal, space/dot for thousands) format.
-    Fixes the 2000,00 -> 200000 issue.
     """
     if not isinstance(value, str): 
         return None
@@ -124,7 +123,6 @@ def clean_value(value):
     value = re.sub(r'(\d)\s+(\d)', r'\1\2', value) 
 
     # 2. Remove thousands separators (dot or space)
-    # Safely remove the dot if it is a thousands separator (e.g., '1.000,00' or '1.000')
     if re.search(r'\d\.\d{3}(?:,\d{2})?', value):
         value = value.replace('.', '')
         
@@ -183,24 +181,48 @@ def standardize_fnb(df):
 def standardize_standard(df):
     """
     Robustly remaps and cleans columns for Standard Bank.
+    INCLUDES FIX: Prevents combining Service Fees with Debits/Credits.
     """
     
-    # Standard Bank uses 6 columns. Check if headers are missing (i.e., column names are integers)
+    # 1. Column Header Check/Remapping
     if 'Debits' not in df.columns and len(df.columns) == 6:
-        st.warning("Standard Bank column headers not detected. Applying fixed column names (Details, Service Fee, Debits, Credits, Date, Balance).")
+        st.warning("Standard Bank column headers not detected. Applying fixed column names...")
         df.columns = ["Details", "Service Fee", "Debits", "Credits", "Date", "Balance"]
     
-    required_cols = ["Details", "Debits", "Credits", "Date"]
+    required_cols = ["Details", "Debits", "Credits", "Date", "Service Fee"] # Ensure Service Fee is checked
     if not all(col in df.columns for col in required_cols):
         raise KeyError(f"Standard Bank parsing failed: Expected columns {required_cols} are not in the extracted DataFrame.")
         
+    # 2. Clean values
     df['Debits'] = df['Debits'].apply(clean_value)
     df['Credits'] = df['Credits'].apply(clean_value)
+    df['Service Fee'] = df['Service Fee'].apply(clean_value)
     
+    # 3. FIX: Adjust Debits/Credits by Service Fee amount
+    # This assumes the amount in Debits/Credits is the combined value (Transaction + Fee).
+    # We subtract the fee to get the base transaction amount.
+    
+    # Service Fee amount is often negative, so we use abs() to get the magnitude of the fee.
+    fee_magnitude = abs(df['Service Fee'].fillna(0))
+    
+    # Mask for rows where a fee is present AND a Debit occurred
+    debit_fee_mask = (df['Service Fee'].notna() & df['Debits'].notna())
+    df.loc[debit_fee_mask, 'Debits'] = df.loc[debit_fee_mask, 'Debits'] - fee_magnitude.loc[debit_fee_mask]
+
+    # Mask for rows where a fee is present AND a Credit occurred (less common)
+    credit_fee_mask = (df['Service Fee'].notna() & df['Credits'].notna())
+    df.loc[credit_fee_mask, 'Credits'] = df.loc[credit_fee_mask, 'Credits'] - fee_magnitude.loc[credit_fee_mask]
+        
+    # 4. Recalculate Amount after fee removal
     df['Amount'] = df['Credits'].fillna(0) - df['Debits'].fillna(0)
     
+    # 5. Final Standardization
     df['Date'] = df['Date'].astype(str)
     df['Description'] = df['Details'].astype(str)
+    
+    # Filter out rows where the amount is zero (e.g. rows that were purely fees that we zeroed out)
+    df = df[df['Amount'].abs() > 0]
+    
     return df[['Date', 'Description', 'Amount']]
 
 def standardize_absa(df):
@@ -253,6 +275,8 @@ def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> pd.DataFr
             2.  'Description': A clean, single-line description of the transaction.
             3.  'Amount': The Rand amount. Debits must be negative (e.g., -100.00), Credits must be positive (e.g., 500.00).
 
+            **CRITICAL RULE: DO NOT MERGE** a transaction amount and its associated bank fee (e.g., service charge, ATM fee) into a single 'Amount' value. Fees must either be extracted as **separate lines** with their own date and description (e.g., 'Service Fee'), or the 'Amount' should **ONLY** reflect the base transaction amount, excluding the fee. The most reliable method is to extract both as separate lines.
+
             **Example JSON Output (Mandatory format):**
             [
               {{
@@ -262,6 +286,11 @@ def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> pd.DataFr
               }},
               {{
                 "Date": "16 Mar 2024",
+                "Description": "FEE IMMEDIATE PAYMENT",
+                "Amount": -4.30
+              }},
+              {{
+                "Date": "17 Mar 2024",
                 "Description": "CREDIT TRANSFER SALARY DEPOSIT",
                 "Amount": 15000.00
               }}
@@ -388,7 +417,7 @@ def parse_pdf_data(pdf_file_path, file_name):
 if 'uploaded_files' not in st.session_state:
     st.session_state['uploaded_files'] = []
 
-st.set_page_config(page_title="🇿🇦 Free SA Bank Statement to Xero CSV Converter", layout="wide")
+st.set_page_config(page_title="🇿🇦 Free SA Bank Statement to CSV Converter", layout="wide")
 
 st.title("🇿🇦 SA Bank Statement PDF to CSV Converter")
 st.markdown("""
@@ -443,7 +472,7 @@ if uploaded_files:
             except Exception as e:
                 st.warning(f"Could not standardize dates for {file_name}. Dates remain in raw format. Error: {e}")
             
-            # *** FIX APPLIED HERE: ONLY include Date, Description, and Amount ***
+            # Final structure: Date, Description, Amount
             df_xero = pd.DataFrame({
                 'Date': df_final['Date'].fillna(''),
                 'Description': df_final['Description'].astype(str),
