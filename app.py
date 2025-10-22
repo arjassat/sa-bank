@@ -161,7 +161,7 @@ def clean_description_for_xero(description):
     
     return description
 
-# --- 3. STANDARDIZATION FUNCTIONS ---
+# --- 3. STANDARDIZATION FUNCTIONS (FEE FILTERING REMOVED) ---
 
 def standardize_fnb(df):
     df.columns = [c.lower().replace(' ', '_') for c in df.columns]
@@ -176,12 +176,13 @@ def standardize_fnb(df):
     df['Amount'] = df.apply(calculate_fnb_amount, axis=1)
     df['Date'] = df['date'].astype(str)
     df['Description'] = df['description'].astype(str)
+    
     return df[['Date', 'Description', 'Amount']]
 
 def standardize_standard(df):
     """
-    Robustly remaps and cleans columns for Standard Bank.
-    INCLUDES FIX: Prevents combining Service Fees with Debits/Credits.
+    FIX: Subtracts the Service Fee from Debits/Credits, but keeps the resulting base transaction line.
+    No fee filtering is applied here.
     """
     
     # 1. Column Header Check/Remapping
@@ -189,7 +190,7 @@ def standardize_standard(df):
         st.warning("Standard Bank column headers not detected. Applying fixed column names...")
         df.columns = ["Details", "Service Fee", "Debits", "Credits", "Date", "Balance"]
     
-    required_cols = ["Details", "Debits", "Credits", "Date", "Service Fee"] # Ensure Service Fee is checked
+    required_cols = ["Details", "Debits", "Credits", "Date", "Service Fee"] 
     if not all(col in df.columns for col in required_cols):
         raise KeyError(f"Standard Bank parsing failed: Expected columns {required_cols} are not in the extracted DataFrame.")
         
@@ -198,18 +199,16 @@ def standardize_standard(df):
     df['Credits'] = df['Credits'].apply(clean_value)
     df['Service Fee'] = df['Service Fee'].apply(clean_value)
     
-    # 3. FIX: Adjust Debits/Credits by Service Fee amount
-    # This assumes the amount in Debits/Credits is the combined value (Transaction + Fee).
-    # We subtract the fee to get the base transaction amount.
-    
-    # Service Fee amount is often negative, so we use abs() to get the magnitude of the fee.
+    # 3. FEE ADJUSTMENT: Subtract the fee from the Debit/Credit amount on lines where it is co-located
+    # This is the core fix to change 804.30 to 800.00.
     fee_magnitude = abs(df['Service Fee'].fillna(0))
     
-    # Mask for rows where a fee is present AND a Debit occurred
+    # Adjust Debits:
     debit_fee_mask = (df['Service Fee'].notna() & df['Debits'].notna())
+    # New Debits = Old Debits - Fee amount (ensures base transaction amount remains)
     df.loc[debit_fee_mask, 'Debits'] = df.loc[debit_fee_mask, 'Debits'] - fee_magnitude.loc[debit_fee_mask]
 
-    # Mask for rows where a fee is present AND a Credit occurred (less common)
+    # Adjust Credits (less common):
     credit_fee_mask = (df['Service Fee'].notna() & df['Credits'].notna())
     df.loc[credit_fee_mask, 'Credits'] = df.loc[credit_fee_mask, 'Credits'] - fee_magnitude.loc[credit_fee_mask]
         
@@ -220,8 +219,8 @@ def standardize_standard(df):
     df['Date'] = df['Date'].astype(str)
     df['Description'] = df['Details'].astype(str)
     
-    # Filter out rows where the amount is zero (e.g. rows that were purely fees that we zeroed out)
-    df = df[df['Amount'].abs() > 0]
+    # Final cleanup to remove rows where the amount is effectively zero
+    df = df[df['Amount'].abs() > 0.01] 
     
     return df[['Date', 'Description', 'Amount']]
 
@@ -231,6 +230,7 @@ def standardize_absa(df):
     df['Amount'] = df['transaction_amount_r'].apply(clean_value)
     df['Date'] = df['date'].astype(str)
     df['Description'] = df['description'].astype(str)
+    
     return df[['Date', 'Description', 'Amount']]
     
 def standardize_hbz(df):
@@ -238,21 +238,20 @@ def standardize_hbz(df):
     df['Credit'] = df['Credit'].apply(clean_value)
     
     df['Amount'] = df['Credit'].fillna(0) - df['Debit'].fillna(0)
-    
     df['Date'] = df['Date'].astype(str)
     df['Description'] = df['Particulars'].astype(str)
+    
     return df[['Date', 'Description', 'Amount']]
 
 def generic_fallback(df):
     st.warning("Could not apply specific standardization. CSV will contain raw extracted columns.")
     return df 
 
-# --- 4. CORE EXTRACTION LOGIC (UPDATED WITH GEMINI FALLBACK) ---
+# --- 4. CORE EXTRACTION LOGIC (GEMINI PROMPT REVERTED TO NEUTRAL) ---
 
 def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> pd.DataFrame:
     """
-    FALLBACK: Uses Gemini's vision capability to perform OCR and structured data extraction
-    from the PDF, which works for both text-based and scanned/image-based files.
+    FALLBACK: Uses Gemini's vision capability for extraction.
     """
     st.info("🔄 **Initiating Gemini OCR/Extraction Fallback...** (This may take a moment)")
     if not client:
@@ -266,16 +265,13 @@ def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> pd.DataFr
         )
         
         prompt = f"""
-            You are a South African accounting assistant. Your task is to extract all transaction lines 
-            from the provided bank statement PDF ({file_name}). 
+            You are a South African accounting assistant. Your task is to extract all **transaction lines** from the provided bank statement PDF ({file_name}). 
             The output **must be a single JSON list** where each item is a transaction.
             
             **Required Columns (MUST be included):**
             1.  'Date': The transaction date (in any format, e.g., '2024/03/16', '16 Mar', '03 16').
-            2.  'Description': A clean, single-line description of the transaction.
-            3.  'Amount': The Rand amount. Debits must be negative (e.g., -100.00), Credits must be positive (e.g., 500.00).
-
-            **CRITICAL RULE: DO NOT MERGE** a transaction amount and its associated bank fee (e.g., service charge, ATM fee) into a single 'Amount' value. Fees must either be extracted as **separate lines** with their own date and description (e.g., 'Service Fee'), or the 'Amount' should **ONLY** reflect the base transaction amount, excluding the fee. The most reliable method is to extract both as separate lines.
+            2.  'Description': A clean, single-line description of the transaction, including any fee description if provided on its own line.
+            3.  'Amount': The Rand amount for that line item. Debits must be negative (e.g., -100.00), Credits must be positive (e.g., 500.00). **CRITICAL: If a transaction amount and a fee amount are listed separately, list them as two separate line items.**
 
             **Example JSON Output (Mandatory format):**
             [
@@ -466,6 +462,8 @@ if uploaded_files:
                 'Amount': 'Amount'
             })
             
+            # *** IMPORTANT: GLOBAL FEE FILTERING IS REMOVED HERE ***
+
             try:
                 # Attempt to parse date in SA format (day/month/year)
                 df_final['Date'] = pd.to_datetime(df_final['Date'], errors='coerce', dayfirst=True).dt.strftime('%d/%m/%Y')
