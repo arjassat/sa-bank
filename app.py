@@ -4,6 +4,7 @@ import pdfplumber
 import re
 from io import BytesIO
 import os
+import numpy as np
 
 # --- AI INTEGRATION SETUP ---
 from google import genai
@@ -33,6 +34,7 @@ client = get_gemini_client()
 
 # Strong list-based rules for detection (used by detect_bank_format)
 BANK_RULES_LIST = [
+    ("NEDBANK", ["nedbank", "current account"]), # New Nedbank rule
     ("FNB", ["fnb.co.za"]),
     ("FNB", ["first national bank", "account"]),
     
@@ -43,13 +45,21 @@ BANK_RULES_LIST = [
     ("STANDARD", ["standard bank", "current account"]),
     
     ("HBZ", ["hbz bank limited", "account"]),
-    
-    ("NEDBANK", ["nedbank limited", "account"]),
     ("CAPITEC", ["capitec bank", "account"]),
 ]
 
 # Map for parsing logic once the bank is detected (used by parse_pdf_data)
 BANK_RULES_MAP = {
+    "NEDBANK": {
+        # Columns: Date, Description, Fee, Amount, Reference, Balance
+        "columns": ["Date", "Description", "Fee", "Amount", "Reference", "Balance"], 
+        "table_settings": {
+            "vertical_strategy": "lines", 
+            "horizontal_strategy": "text",
+            "snap_y_tolerance": 3
+        },
+        "standardize_func": "standardize_nedbank"
+    },
     "FNB": {
         "columns": ["Date", "Description", "Amount", "Balance"],
         "table_settings": {
@@ -123,6 +133,7 @@ def clean_value(value):
     value = re.sub(r'(\d)\s+(\d)', r'\1\2', value) 
 
     # 2. Remove thousands separators (dot or space)
+    # This prevents '1.000,00' from becoming '1000.00' if it's actually '1.00'
     if re.search(r'\d\.\d{3}(?:,\d{2})?', value):
         value = value.replace('.', '')
         
@@ -161,18 +172,54 @@ def clean_description_for_xero(description):
     
     return description
 
-# --- 3. STANDARDIZATION FUNCTIONS (FNB ACCRUED BANK CHARGES FIX) ---
+# --- 3. STANDARDIZATION FUNCTIONS (FEE FILTERING LOGIC) ---
+
+def standardize_nedbank(df):
+    """
+    FIXED: Nedbank - Hard-selects columns [0, 1, 3] to explicitly skip the fee column (index 2).
+    """
+    
+    num_cols = df.shape[1]
+    
+    if num_cols >= 6:
+        # Typical 6-column Nedbank layout: [Date (0), Description (1), Fee (2), Amount (3), Ref/Empty (4), Balance (5)]
+        st.info("Nedbank: Detected 6+ columns. **Explicitly selecting [0, 1, 3] to skip Fee column (2).**")
+        df_base = df.iloc[:, [0, 1, 3]].copy()
+    elif num_cols >= 4: # Handle 4 or 5 column variations
+        st.warning(f"Nedbank: Detected {num_cols} columns (unusual). Assuming Fee column was not extracted and taking first 3.")
+        df_base = df.iloc[:, :3].copy()
+    else: # Less than 4 columns (Extraction failure)
+        st.error(f"Nedbank standardization failed: Too few columns ({num_cols}).")
+        return pd.DataFrame()
+        
+    # 2. Rename and Clean
+    if df_base.shape[1] == 3:
+        df_base.columns = ['Date', 'Description', 'Amount_Raw']
+        
+        # 3. Calculate signed amount
+        df_base['Amount'] = df_base['Amount_Raw'].apply(clean_value)
+    else:
+        st.error("Nedbank standardization failed: Final column count is not 3 after filtering.")
+        return pd.DataFrame()
+    
+    # 4. Final Standardization
+    df_base['Date'] = df_base['Date'].astype(str)
+    df_base['Description'] = df_base['Description'].astype(str)
+    
+    # Final cleanup to remove rows where the amount is effectively zero
+    df_base = df_base[df_base['Amount'].abs().fillna(0) > 0.01] 
+    
+    return df_base[['Date', 'Description', 'Amount']]
 
 def standardize_fnb(df):
     """
-    FIXED: Subtracts the 'Accrued Bank Charges' column value from the 'Amount' column
+    FNB: Subtracts the 'Accrued Bank Charges' column value from the 'Amount' column
     to get the correct base transaction value, without filtering the row.
     """
     # Normalize columns
     new_columns = []
     for col in df.columns:
         if isinstance(col, str):
-            # Normalization to handle FNB's complex headers like 'Description Date' or 'Accrued Bank Charges'
             col = col.replace('\n', ' ').replace('\r', ' ').strip()
             col = re.sub(r'\s{2,}', ' ', col)
             col = col.lower().replace(' ', '_')
@@ -228,14 +275,13 @@ def standardize_fnb(df):
     df['Date'] = df[date_col].astype(str)
     df['Description'] = df[description_col].astype(str)
     
-    df = df[df['Amount'].abs() > 0.01] 
+    df = df[df['Amount'].abs().fillna(0) > 0.01] 
     
     return df[['Date', 'Description', 'Amount']]
 
 def standardize_standard(df):
     """
-    FIXED: Subtracts the Service Fee from Debits/Credits, but keeps the resulting base transaction line.
-    No fee filtering is applied here.
+    Standard Bank: Subtracts the Service Fee from Debits/Credits, but keeps the resulting base transaction line.
     """
     
     # 1. Column Header Check/Remapping
@@ -271,7 +317,7 @@ def standardize_standard(df):
     df['Description'] = df['Details'].astype(str)
     
     # Final cleanup to remove rows where the amount is effectively zero
-    df = df[df['Amount'].abs() > 0.01] 
+    df = df[df['Amount'].abs().fillna(0) > 0.01] 
     
     return df[['Date', 'Description', 'Amount']]
 
@@ -416,7 +462,9 @@ def parse_pdf_data(pdf_file_path, file_name):
             all_transactions.dropna(thresh=2, inplace=True)
             
             standardize_func_name = rules["standardize_func"]
-            if standardize_func_name == "standardize_fnb":
+            if standardize_func_name == "standardize_nedbank":
+                df_final = standardize_nedbank(all_transactions.copy())
+            elif standardize_func_name == "standardize_fnb":
                 df_final = standardize_fnb(all_transactions.copy())
             elif standardize_func_name == "standardize_standard":
                 df_final = standardize_standard(all_transactions.copy())
@@ -470,7 +518,7 @@ st.title("🇿🇦 SA Bank Statement PDF to CSV Converter")
 st.markdown("""
     ### Built with Gemini AI for accountants: Free, robust tool for South African bank statement conversion.
     
-    **Supported Banks (with custom rules): ABSA, FNB, Standard Bank, HBZ.** Uses **Gemini AI** as a powerful **fallback** for **scanned or difficult PDFs**.
+    **Supported Banks (with custom rules): Nedbank, ABSA, FNB, Standard Bank, HBZ.** Uses **Gemini AI** as a powerful **fallback** for **scanned or difficult PDFs**.
     ---
 """)
 
