@@ -4,7 +4,6 @@ import pdfplumber
 import re
 from io import BytesIO
 import os
-import numpy as np
 
 # --- AI INTEGRATION SETUP ---
 from google import genai
@@ -34,7 +33,6 @@ client = get_gemini_client()
 
 # Strong list-based rules for detection (used by detect_bank_format)
 BANK_RULES_LIST = [
-    ("NEDBANK", ["nedbank", "current account"]), # New Nedbank rule
     ("FNB", ["fnb.co.za"]),
     ("FNB", ["first national bank", "account"]),
     
@@ -45,20 +43,13 @@ BANK_RULES_LIST = [
     ("STANDARD", ["standard bank", "current account"]),
     
     ("HBZ", ["hbz bank limited", "account"]),
+    
+    ("NEDBANK", ["nedbank limited", "account"]),
     ("CAPITEC", ["capitec bank", "account"]),
 ]
 
 # Map for parsing logic once the bank is detected (used by parse_pdf_data)
 BANK_RULES_MAP = {
-    "NEDBANK": {
-        "columns": ["Date", "Description", "Fee", "Amount", "Reference", "Balance"], # Placeholder names for alignment
-        "table_settings": {
-            "vertical_strategy": "lines", 
-            "horizontal_strategy": "text",
-            "snap_y_tolerance": 3
-        },
-        "standardize_func": "standardize_nedbank"
-    },
     "FNB": {
         "columns": ["Date", "Description", "Amount", "Balance"],
         "table_settings": {
@@ -170,36 +161,7 @@ def clean_description_for_xero(description):
     
     return description
 
-# --- 3. STANDARDIZATION FUNCTIONS (FEE FILTERING LOGIC) ---
-
-def standardize_nedbank(df):
-    """
-    NEDBANK FIX: Explicitly drops the column containing the separate, unwanted fee amount.
-    Nedbank tables often have 6 columns, with the Fee in the 3rd data column (index 2).
-    """
-    
-    # 1. Drop columns that are not needed. Based on user file, the fee is the 3rd data column.
-    if df.shape[1] >= 6:
-        st.info("Nedbank: Explicitly dropping fee column (index 2) to prevent duplicate fee transactions.")
-        # Drop Fee column (index 2) and usually an empty ref column (index 4) and Balance (index 5)
-        df_base = df.iloc[:, [0, 1, 3]].copy() 
-    else:
-        st.warning(f"Nedbank: Expected >= 6 columns, found {df.shape[1]}. Falling back to generic indexing.")
-        df_base = df.iloc[:, [0, 1, 2]].copy() # Fallback to Date, Description, Amount
-        
-    df_base.columns = ['Date', 'Description', 'Amount_Raw']
-        
-    # 2. Calculate signed amount
-    df_base['Amount'] = df_base['Amount_Raw'].apply(clean_value)
-
-    # 3. Final Standardization
-    df_base['Date'] = df_base['Date'].astype(str)
-    df_base['Description'] = df_base['Description'].astype(str)
-    
-    # Final cleanup to remove rows where the amount is effectively zero
-    df_base = df_base[df_base['Amount'].abs() > 0.01] 
-    
-    return df_base[['Date', 'Description', 'Amount']]
+# --- 3. STANDARDIZATION FUNCTIONS (FNB ACCRUED BANK CHARGES FIX) ---
 
 def standardize_fnb(df):
     """
@@ -210,6 +172,7 @@ def standardize_fnb(df):
     new_columns = []
     for col in df.columns:
         if isinstance(col, str):
+            # Normalization to handle FNB's complex headers like 'Description Date' or 'Accrued Bank Charges'
             col = col.replace('\n', ' ').replace('\r', ' ').strip()
             col = re.sub(r'\s{2,}', ' ', col)
             col = col.lower().replace(' ', '_')
@@ -453,9 +416,7 @@ def parse_pdf_data(pdf_file_path, file_name):
             all_transactions.dropna(thresh=2, inplace=True)
             
             standardize_func_name = rules["standardize_func"]
-            if standardize_func_name == "standardize_nedbank":
-                df_final = standardize_nedbank(all_transactions.copy())
-            elif standardize_func_name == "standardize_fnb":
+            if standardize_func_name == "standardize_fnb":
                 df_final = standardize_fnb(all_transactions.copy())
             elif standardize_func_name == "standardize_standard":
                 df_final = standardize_standard(all_transactions.copy())
@@ -509,7 +470,7 @@ st.title("🇿🇦 SA Bank Statement PDF to CSV Converter")
 st.markdown("""
     ### Built with Gemini AI for accountants: Free, robust tool for South African bank statement conversion.
     
-    **Supported Banks (with custom rules): Nedbank, ABSA, FNB, Standard Bank, HBZ.** Uses **Gemini AI** as a powerful **fallback** for **scanned or difficult PDFs**.
+    **Supported Banks (with custom rules): ABSA, FNB, Standard Bank, HBZ.** Uses **Gemini AI** as a powerful **fallback** for **scanned or difficult PDFs**.
     ---
 """)
 
