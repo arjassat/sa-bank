@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-# pdfplumber is no longer required
 import re
 from io import BytesIO
 import os
@@ -88,14 +87,14 @@ def clean_description_for_xero(description):
     
     return description
 
-# --- 4. CORE EXTRACTION LOGIC (GEMINI ONLY) ---
+# --- 4. CORE EXTRACTION LOGIC (GEMINI ONLY - WITH FEE EXCLUSION) ---
 
 def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> pd.DataFrame:
     """
-    PRIMARY METHOD: Uses Gemini's vision capability for extraction based on strict JSON rules.
-    This function's prompt is designed to separate main transactions and fees.
+    PRIMARY METHOD: Uses Gemini's vision capability for extraction based on strict JSON rules, 
+    with explicit instructions to exclude fees.
     """
-    st.info("🔄 **Initiating Gemini AI Extraction...** (This may take a moment)")
+    st.info("🔄 **Initiating Gemini AI Extraction...** (Excluding Fees)")
     if not client:
         st.error("Gemini client is inactive. Cannot run AI extraction.")
         return pd.DataFrame()
@@ -107,25 +106,23 @@ def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> pd.DataFr
         )
         
         prompt = f"""
-            You are a South African accounting assistant. Your task is to extract all **transaction lines** from the provided bank statement PDF ({file_name}). 
+            You are a South African accounting assistant. Your task is to extract all **core transaction lines** from the provided bank statement PDF ({file_name}). 
             The output **must be a single JSON list** where each item is a transaction.
+
+            **CRITICAL RULE: DO NOT include any line item that represents a Bank Fee, Service Fee, ATM Fee, Monthly Account Fee, VAT charge, Interest charge, or any other bank-related charge.** **Only extract the main transaction** (e.g., EFT, POS Payment, Salary Deposit, main Debit/Credit). If a fee is listed next to a transaction, ignore the fee and only extract the main transaction amount and description.
             
             **Required Columns (MUST be included):**
             1.  'Date': The transaction date (in any format, e.g., '2024/03/16', '16 Mar', '03 16').
-            2.  'Description': A clean, single-line description of the transaction, including any fee description if provided on its own line.
-            3.  'Amount': The Rand amount for that line item. Debits must be negative (e.g., -100.00), Credits must be positive (e.g., 500.00). **CRITICAL: If a transaction amount and a fee amount are listed separately, list them as two separate line items.**
+            2.  'Description': A clean, single-line description of the **main transaction**.
+            3.  'Amount': The Rand amount for that line item. Debits must be negative (e.g., -2500.00), Credits must be positive (e.g., 15000.00).
 
             **Example JSON Output (Mandatory format):**
+            // Note: The example shows the successful omission of the fee line item.
             [
               {{
                 "Date": "16 Mar 2024",
                 "Description": "IMMEDIATE PAYMENT 145089014 FAWZIA BAYAT",
                 "Amount": -2500.00
-              }},
-              {{
-                "Date": "16 Mar 2024",
-                "Description": "FEE IMMEDIATE PAYMENT",
-                "Amount": -4.30
               }},
               {{
                 "Date": "17 Mar 2024",
@@ -148,7 +145,7 @@ def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> pd.DataFr
         data = json.loads(json_text)
         
         if isinstance(data, list) and data:
-            st.success(f"Gemini AI Extraction successful! Extracted {len(data)} transactions.")
+            st.success(f"Gemini AI Extraction successful! Extracted {len(data)} **core** transactions (Fees excluded by instruction).")
             return pd.DataFrame(data)
         else:
             st.error("Gemini extracted a result, but it was empty or not a valid list of transactions.")
@@ -163,18 +160,13 @@ def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> pd.DataFr
 
 
 def parse_pdf_data(pdf_file_path, file_name):
-    """
-    Modified core function: Now uses only Gemini AI for extraction.
-    This enforces the desired output format of separated fees.
-    """
+    """Core function: Now uses only Gemini AI for extraction with explicit fee exclusion."""
     
-    pdf_file_path.seek(0) # Ensure the file pointer is at the beginning
+    pdf_file_path.seek(0)
     
-    # --- PHASE 1: GEMINI EXTRACTION (Now the sole method) ---
     df_gemini = gemini_extract_from_pdf(pdf_file_path, file_name)
     
     if not df_gemini.empty:
-        # Standardization and cleaning steps
         required_cols = ['Date', 'Description', 'Amount']
         if not all(col in df_gemini.columns for col in required_cols):
              st.error("AI output is missing required columns (Date, Description, Amount).")
@@ -183,12 +175,11 @@ def parse_pdf_data(pdf_file_path, file_name):
         df_gemini['Date'] = df_gemini['Date'].astype(str)
         df_gemini['Description'] = df_gemini['Description'].astype(str)
         
-        # Apply the fixed clean_value to the AI's amount column for safety
         df_gemini['Amount'] = df_gemini['Amount'].apply(lambda x: clean_value(x)) 
         df_gemini.dropna(subset=['Amount'], inplace=True)
         
         if not df_gemini.empty:
-            return df_gemini[['Date', 'Description', 'Amount']], "AI_ONLY"
+            return df_gemini[['Date', 'Description', 'Amount']], "AI_ONLY_NO_FEES"
 
     st.error(f"Gemini AI extraction failed for {file_name}. No data extracted.")
     return pd.DataFrame(), "FAILED"
@@ -199,18 +190,16 @@ def parse_pdf_data(pdf_file_path, file_name):
 if 'uploaded_files' not in st.session_state:
     st.session_state['uploaded_files'] = []
 
-st.set_page_config(page_title="🇿🇦 Free SA Bank Statement to CSV Converter (AI Only)", layout="wide")
+st.set_page_config(page_title="🇿🇦 Free SA Bank Statement to CSV Converter (AI No Fees)", layout="wide")
 
-st.title("🇿🇦 SA Bank Statement PDF to CSV Converter (AI-Only)")
+st.title("🇿🇦 SA Bank Statement PDF to CSV Converter (AI-Only - No Fees)")
 st.markdown("""
-    ### Now using **Gemini AI exclusively** for robust extraction and separate fee line items.
-    
-    This version skips the PDF table parsing to ensure **all transactions and bank fees are captured on separate lines** for easier Xero/accounting reconciliation.
+    ### Now using **Gemini AI exclusively** with instructions to **filter out all bank fees** for clean reconciliation data.
     ---
 """)
 
 if client:
-    st.sidebar.success("Gemini AI Engine: **Active** ✅ (Exclusive Use)")
+    st.sidebar.success("Gemini AI Engine: **Active** ✅ (Exclusive Use - **Fees Excluded**)")
 else:
     st.sidebar.warning("Gemini AI Engine: **Inactive** 🛑. Please set **GEMINI_API_KEY** in Streamlit Secrets.")
 
@@ -234,7 +223,6 @@ if uploaded_files:
         
         pdf_data = BytesIO(uploaded_file.read())
         
-        # CORE CALL: Now exclusively uses the AI logic
         df_transactions, source = parse_pdf_data(pdf_data, file_name)
 
         if not df_transactions.empty and 'Amount' in df_transactions.columns:
@@ -268,7 +256,7 @@ if uploaded_files:
             
             all_df.append(df_xero)
             
-            st.success(f"Successfully extracted {len(df_xero)} transactions from {file_name} using **Gemini AI**.")
+            st.success(f"Successfully extracted {len(df_xero)} core transactions from {file_name}")
 
     
     # --- 6. COMBINE AND DOWNLOAD ---
@@ -277,15 +265,15 @@ if uploaded_files:
         final_combined_df = pd.concat(all_df, ignore_index=True)
         
         st.markdown("---")
-        st.subheader("✅ All Transactions Combined and Ready for Download")
+        st.subheader("✅ All **Core** Transactions Combined and Ready for Download")
         
         st.dataframe(final_combined_df)
         
         # Convert DataFrame to CSV for download
         csv_output = final_combined_df.to_csv(index=False, sep=',', encoding='utf-8')
         st.download_button(
-            label="⬇️ Download Bank Statement CSV File",
+            label="⬇️ Download Fee-Excluded CSV File",
             data=csv_output,
-            file_name="SA_Bank_Statements_AI_Export.csv",
+            file_name="SA_Bank_Statements_NO_FEES_Export.csv",
             mime="text/csv"
         )
