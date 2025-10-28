@@ -5,6 +5,7 @@ from io import BytesIO
 import os
 
 # --- AI INTEGRATION SETUP ---
+# Ensure you have installed google-genai: pip install google-genai
 from google import genai
 from google.genai import types 
 from google.genai.errors import APIError
@@ -12,14 +13,20 @@ from google.genai.errors import APIError
 @st.cache_resource(show_spinner=False)
 def get_gemini_client():
     """Initializes the Gemini client using the key from Streamlit Secrets."""
+    # NOTE: This assumes GEMINI_API_KEY is configured in Streamlit Secrets
     if "GEMINI_API_KEY" not in st.secrets:
+        # st.error("GEMINI_API_KEY not found in Streamlit secrets.")
         return None
     
     api_key = st.secrets["GEMINI_API_KEY"]
     os.environ["GEMINI_API_KEY"] = api_key
     
     try:
-        return genai.Client()
+        # Check if the environment variable is set before creating the client
+        if os.getenv("GEMINI_API_KEY"):
+            return genai.Client()
+        else:
+            return None
     except Exception as e:
         st.error(f"Error initializing Gemini client: {e}")
         return None
@@ -89,15 +96,15 @@ def clean_description_for_xero(description):
 
 # --- 4. CORE EXTRACTION LOGIC (GEMINI ONLY - WITH PRECISION COLUMN EXCLUSION) ---
 
-def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> pd.DataFrame:
+def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> tuple[pd.DataFrame, str | None]:
     """
     PRIMARY METHOD: Uses Gemini's vision capability for extraction based on strict JSON rules, 
-    focusing ONLY on excluding the dedicated Fees (R) column.
+    focusing on excluding the dedicated Fees (R) column and extracting the StatementYear.
+    Returns a DataFrame and the extracted year (as a string, or None on failure).
     """
-    st.info("🔄 **Initiating Gemini AI Extraction...** (Excluding Fees column, retaining all other transactions)")
+    st.info("🔄 **Initiating Gemini AI Extraction...** (Extracting Year and Transactions)")
     if not client:
-        st.error("Gemini client is inactive. Cannot run AI extraction.")
-        return pd.DataFrame()
+        return pd.DataFrame(), None 
 
     try:
         pdf_part = types.Part.from_bytes(
@@ -105,43 +112,42 @@ def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> pd.DataFr
             mime_type='application/pdf'
         )
         
-        # --- THE CRITICAL, REFINED PROMPT ---
+        # --- THE CRITICAL, REFINED PROMPT (UPDATED FOR DYNAMIC YEAR EXTRACTION) ---
         prompt = f"""
-            You are a South African accounting assistant. Your task is to extract all **transaction lines** from the provided bank statement PDF ({file_name}). 
-            The output **must be a single JSON list** where each item is a transaction.
+            You are a South African accounting assistant. Your task is to extract the **statement year** and all **transaction lines** from the provided bank statement PDF ({file_name}). 
+            The output **must be a single JSON object**.
 
-            **ABSOLUTE CRITICAL INSTRUCTION (MUST FOLLOW):**
-            1.  **Fee Column Exclusion (The ONLY Exclusion):** If the statement layout shows separate columns for 'Fees (R)', 'Debits (R)', and 'Credits (R)' (like Nedbank), you MUST:
+            **Required Output Structure (Mandatory):**
+            1.  'StatementYear': The four-digit year (e.g., "2025") found in the 'Statement Period' or 'Statement Date' section at the top of the statement.
+            2.  'Transactions': A list of all transaction lines, where each item is a transaction object.
+
+            **ABSOLUTE CRITICAL INSTRUCTION (MUST FOLLOW FOR TRANSACTIONS):**
+            1.  **Fee Column Exclusion (The ONLY Exclusion):** If the statement layout shows separate columns for 'Fees (R)', 'Debits (R)', and 'Credits (R)', you MUST:
                 * **IGNORE** the value in the dedicated **'Fees (R)' column** completely.
                 * Extract the transaction 'Amount' **ONLY** from the 'Debits (R)' or 'Credits (R)' column.
-            2.  **Inclusion of ALL Other Lines:** You MUST **INCLUDE** every transaction line item that has an amount in the 'Debits (R)' or 'Credits (R)' column. This includes items whose description contains words like 'FEE', 'SERVICE', or 'CHARGE' (e.g., 'ATM/SSD WITHDRAWAL FEE'). Do NOT filter based on the description text.
+            2.  **Inclusion of ALL Other Lines:** You MUST **INCLUDE** every transaction line item that has an amount in the 'Debits (R)' or 'Credits (R)' column.
 
-            **Only extract the core transaction amount from the Debits/Credits column.**
-
-            **Required Columns (MUST be included):**
-            1.  'Date': The transaction date (in any format, e.g., '2024/03/16', '16 Mar', '03 16').
+            **Transaction Required Columns:**
+            1.  'Date': The transaction date (in Day Month format, e.g., '01 Sep', '16 Mar').
             2.  'Description': A clean, single-line description of the transaction.
-            3.  'Amount': The Rand amount extracted **only from the Debit/Credit column**. Debits must be negative (e.g., -2500.00), Credits must be positive (e.g., 15000.00).
+            3.  'Amount': The Rand amount from the Debit/Credit column (Debits must be negative, Credits positive).
 
             **Example JSON Output (Mandatory format):**
-            // The ATM FEE line is included because its amount is in the Debits column, but the separate Fees (R) column value is ignored.
-            [
-              {{
-                "Date": "02/06/2023",
-                "Description": "ATM/SSD WITHDRAWAL FEE",
-                "Amount": -100.00
-              }},
-              {{
-                "Date": "16 Mar 2024",
-                "Description": "IMMEDIATE PAYMENT 145089014 FAWZIA BAYAT",
-                "Amount": -2500.00
-              }},
-              {{
-                "Date": "17 Mar 2024",
-                "Description": "CREDIT TRANSFER SALARY DEPOSIT",
-                "Amount": 15000.00
-              }}
-            ]
+            {{
+                "StatementYear": "2025",
+                "Transactions": [
+                    {{
+                        "Date": "02/06",
+                        "Description": "ATM/SSD WITHDRAWAL FEE",
+                        "Amount": -100.00
+                    }},
+                    {{
+                        "Date": "16 Mar",
+                        "Description": "IMMEDIATE PAYMENT FAWZIA BAYAT",
+                        "Amount": -2500.00
+                    }}
+                ]
+            }}
         """
         
         response = client.models.generate_content(
@@ -153,36 +159,38 @@ def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> pd.DataFr
         import json
         
         json_text = response.text.strip().strip('```json').strip('```')
-        
         data = json.loads(json_text)
         
-        if isinstance(data, list) and data:
-            st.success(f"Gemini AI Extraction successful! Extracted {len(data)} transactions (Only Fees column excluded).")
-            return pd.DataFrame(data)
+        if isinstance(data, dict) and 'StatementYear' in data and 'Transactions' in data and isinstance(data['Transactions'], list):
+            statement_year = str(data['StatementYear']).strip()
+            
+            st.success(f"Gemini AI Extraction successful! Year **{statement_year}** extracted with {len(data['Transactions'])} transactions.")
+            return pd.DataFrame(data['Transactions']), statement_year
         else:
-            st.error("Gemini extracted a result, but it was empty or not a valid list of transactions.")
-            return pd.DataFrame()
+            st.error("Gemini extracted a result, but it was not the expected JSON structure (missing StatementYear or Transactions list).")
+            return pd.DataFrame(), None
             
     except APIError as e:
         st.error(f"Gemini API Error: {e}. Check your API key or contact support.")
-        return pd.DataFrame()
+        return pd.DataFrame(), None
     except Exception as e:
         st.error(f"Gemini AI Extraction failed due to an unexpected error. Error: {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(), None
 
 
 def parse_pdf_data(pdf_file_path, file_name):
-    """Core function: Now uses only Gemini AI for extraction with explicit fee column exclusion."""
+    """Core function: Uses Gemini AI for dynamic extraction, returning DataFrame and Year."""
     
     pdf_file_path.seek(0)
     
-    df_gemini = gemini_extract_from_pdf(pdf_file_path, file_name)
+    # Updated to capture both the DataFrame and the extracted year
+    df_gemini, statement_year = gemini_extract_from_pdf(pdf_file_path, file_name)
     
-    if not df_gemini.empty:
+    if not df_gemini.empty and statement_year:
         required_cols = ['Date', 'Description', 'Amount']
         if not all(col in df_gemini.columns for col in required_cols):
-             st.error("AI output is missing required columns (Date, Description, Amount).")
-             return pd.DataFrame(), "FAILED"
+             st.error("AI output is missing required columns (Date, Description, Amount) in the transaction list.")
+             return pd.DataFrame(), None
 
         df_gemini['Date'] = df_gemini['Date'].astype(str)
         df_gemini['Description'] = df_gemini['Description'].astype(str)
@@ -191,10 +199,11 @@ def parse_pdf_data(pdf_file_path, file_name):
         df_gemini.dropna(subset=['Amount'], inplace=True)
         
         if not df_gemini.empty:
-            return df_gemini[['Date', 'Description', 'Amount']], "AI_ONLY_COLUMN_EXCLUSION"
+            # Return the processed DataFrame and the extracted year
+            return df_gemini[['Date', 'Description', 'Amount']], statement_year
 
-    st.error(f"Gemini AI extraction failed for {file_name}. No data extracted.")
-    return pd.DataFrame(), "FAILED"
+    st.error(f"Gemini AI extraction failed for {file_name}. No data or year extracted.")
+    return pd.DataFrame(), None
 
 
 # --- 5. STREAMLIT APP LOGIC ---
@@ -204,14 +213,14 @@ if 'uploaded_files' not in st.session_state:
 
 st.set_page_config(page_title="🇿🇦 Free SA Bank Statement to CSV Converter (AI Column-Only Filter)", layout="wide")
 
-st.title("🇿🇦 SA Bank Statement PDF to CSV Converter (AI-Only - Column Exclusion)")
+st.title("🇿🇦 SA Bank Statement PDF to CSV Converter (AI-Only - Dynamic Year)")
 st.markdown("""
-    ### Now using **Gemini AI exclusively** with instructions to **ONLY exclude the dedicated Fees (R) column**, keeping all other transactions including standalone fee line items.
+    ### Now using **Gemini AI exclusively** to **dynamically extract the statement year** and transactions, filtering only the dedicated Fees (R) column.
     ---
 """)
 
 if client:
-    st.sidebar.success("Gemini AI Engine: **Active** ✅ (Exclusive Use - **Fees Column Filtered**)")
+    st.sidebar.success("Gemini AI Engine: **Active** ✅ (Exclusive Use - **Dynamic Year Extraction**)")
 else:
     st.sidebar.warning("Gemini AI Engine: **Inactive** 🛑. Please set **GEMINI_API_KEY** in Streamlit Secrets.")
 
@@ -235,9 +244,13 @@ if uploaded_files:
         
         pdf_data = BytesIO(uploaded_file.read())
         
-        df_transactions, source = parse_pdf_data(pdf_data, file_name)
+        # Capture both the DataFrame and the dynamically extracted year
+        df_transactions, statement_year = parse_pdf_data(pdf_data, file_name)
 
-        if not df_transactions.empty and 'Amount' in df_transactions.columns:
+        if not df_transactions.empty and 'Amount' in df_transactions.columns and statement_year:
+            
+            # The dynamically extracted year is now used for standardization
+            current_year = statement_year 
             
             # Apply final cleaning and formatting
             df_transactions['Description'] = df_transactions['Description'].apply(clean_description_for_xero)
@@ -248,11 +261,40 @@ if uploaded_files:
                 'Amount': 'Amount'
             })
             
+            # --- START: DATE FIX IMPLEMENTATION (Using dynamic year) ---
             try:
-                # Attempt to parse date in SA format (day/month/year)
-                df_final['Date'] = pd.to_datetime(df_final['Date'], errors='coerce', dayfirst=True).dt.strftime('%d/%m/%Y')
+                # 1. Clean the date string 
+                df_final['Date_Raw'] = df_final['Date'].astype(str).str.strip()
+
+                # 2. Append the correct year to the extracted date (e.g., '01 Sep' -> '01 Sep 2025')
+                df_final['Date_With_Year'] = df_final['Date_Raw'] + ' ' + current_year
+
+                # 3. Attempt to parse the date using the explicit 'Day AbbreviatedMonth Year' format, which is common.
+                df_final['Date_Parsed'] = pd.to_datetime(
+                    df_final['Date_With_Year'], 
+                    format='%d %b %Y', 
+                    errors='coerce'
+                )
+
+                # 4. Handle cases where the AI may have output the date in a standard format or failed step 3
+                failed_parsing = df_final['Date_Parsed'].isna()
+                if failed_parsing.any():
+                    # Fallback to general dayfirst parsing on the original raw date
+                    df_final.loc[failed_parsing, 'Date_Parsed'] = pd.to_datetime(
+                        df_final.loc[failed_parsing, 'Date_Raw'], 
+                        errors='coerce', 
+                        dayfirst=True 
+                    )
+                
+                # 5. Format and update the final 'Date' column
+                df_final['Date'] = df_final['Date_Parsed'].dt.strftime('%d/%m/%Y')
+                
+                # Drop rows where date parsing still failed
+                df_final.dropna(subset=['Date'], inplace=True)
+                
             except Exception as e:
                 st.warning(f"Could not standardize dates for {file_name}. Dates remain in raw format. Error: {e}")
+            # --- END: DATE FIX IMPLEMENTATION ---
             
             # Final structure: Date, Description, Amount
             df_xero = pd.DataFrame({
@@ -268,7 +310,7 @@ if uploaded_files:
             
             all_df.append(df_xero)
             
-            st.success(f"Successfully extracted {len(df_xero)} transactions from {file_name}")
+            st.success(f"Successfully extracted {len(df_xero)} transactions from {file_name} (Year: {statement_year})")
 
     
     # --- 6. COMBINE AND DOWNLOAD ---
@@ -277,7 +319,7 @@ if uploaded_files:
         final_combined_df = pd.concat(all_df, ignore_index=True)
         
         st.markdown("---")
-        st.subheader("✅ All Transactions Combined and Ready for Download (Fees Column Excluded)")
+        st.subheader("✅ All Transactions Combined and Ready for Download (Fees Column Excluded, Year Dynamic)")
         
         st.dataframe(final_combined_df)
         
@@ -286,6 +328,6 @@ if uploaded_files:
         st.download_button(
             label="⬇️ Download Column-Filtered CSV File",
             data=csv_output,
-            file_name="SA_Bank_Statements_Column_Filtered_Export.csv",
+            file_name="SA_Bank_Statements_Dynamic_Year_Export.csv",
             mime="text/csv"
         )
