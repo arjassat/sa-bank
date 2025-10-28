@@ -64,7 +64,8 @@ def clean_value(value):
     value = value.replace(',', '.')
     
     # 4. Clean up formatting indicators (Dr/Cr)
-    value = value.replace('Cr', '').replace('Dr', '-').strip()
+    # NOTE: This ensures that if the AI missed the sign, the 'Dr' prefix/suffix is converted to a minus sign.
+    value = value.replace('Cr', '').replace('Dr', '-').strip() 
     
     # 5. Final aggressive cleanup to remove non-numeric/non-dot/non-sign characters
     value = re.sub(r'[^\d\.\-]+', '', value) 
@@ -99,7 +100,8 @@ def clean_description_for_xero(description):
 def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> tuple[pd.DataFrame, str | None]:
     """
     PRIMARY METHOD: Uses Gemini's vision capability for extraction based on strict JSON rules, 
-    focusing on excluding the dedicated Fees (R) column and extracting the StatementYear.
+    focusing on excluding the dedicated Fees (R) column, extracting the StatementYear, 
+    and enforcing the sign convention (Credit = Positive, Debit = Negative).
     Returns a DataFrame and the extracted year (as a string, or None on failure).
     """
     st.info("🔄 **Initiating Gemini AI Extraction...** (Extracting Year and Transactions)")
@@ -112,7 +114,7 @@ def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> tuple[pd.
             mime_type='application/pdf'
         )
         
-        # --- THE CRITICAL, REFINED PROMPT (UPDATED FOR DYNAMIC YEAR EXTRACTION) ---
+        # --- THE CRITICAL, REFINED PROMPT (UPDATED FOR DYNAMIC YEAR & SIGN ENFORCEMENT) ---
         prompt = f"""
             You are a South African accounting assistant. Your task is to extract the **statement year** and all **transaction lines** from the provided bank statement PDF ({file_name}). 
             The output **must be a single JSON object**.
@@ -130,21 +132,28 @@ def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> tuple[pd.
             **Transaction Required Columns:**
             1.  'Date': The transaction date (in Day Month format, e.g., '01 Sep', '16 Mar').
             2.  'Description': A clean, single-line description of the transaction.
-            3.  'Amount': The Rand amount from the Debit/Credit column (Debits must be negative, Credits positive).
+            3.  'Amount': The Rand amount for the transaction. **CRITICAL SIGN RULE:** You must assign the sign based on the transaction type:
+                * **Credits** (transactions increasing the balance, often marked 'Cr' or found in a 'Credits' column) **must be positive** (e.g., 15000.00).
+                * **Debits** (transactions decreasing the balance, often marked 'Dr' or having no marker on FNB statements) **must be negative** (e.g., -2500.00).
 
             **Example JSON Output (Mandatory format):**
             {{
                 "StatementYear": "2025",
                 "Transactions": [
                     {{
-                        "Date": "02/06",
+                        "Date": "02 Sep",
                         "Description": "ATM/SSD WITHDRAWAL FEE",
-                        "Amount": -100.00
+                        "Amount": -100.00 // Negative because it's a Debit
                     }},
                     {{
                         "Date": "16 Mar",
                         "Description": "IMMEDIATE PAYMENT FAWZIA BAYAT",
-                        "Amount": -2500.00
+                        "Amount": -2500.00 // Negative because it's a Debit
+                    }},
+                    {{
+                        "Date": "17 Mar",
+                        "Description": "SALARY DEPOSIT",
+                        "Amount": 15000.00 // Positive because it's a Credit
                     }}
                 ]
             }}
@@ -159,7 +168,17 @@ def gemini_extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> tuple[pd.
         import json
         
         json_text = response.text.strip().strip('```json').strip('```')
-        data = json.loads(json_text)
+        
+        # Robustly handle potential empty response or non-JSON output
+        if not json_text:
+             st.error("AI output was empty.")
+             return pd.DataFrame(), None
+
+        try:
+            data = json.loads(json_text)
+        except json.JSONDecodeError as e:
+            st.error(f"Failed to parse AI JSON response: {e}. Raw response snippet: {json_text[:200]}...")
+            return pd.DataFrame(), None
         
         if isinstance(data, dict) and 'StatementYear' in data and 'Transactions' in data and isinstance(data['Transactions'], list):
             statement_year = str(data['StatementYear']).strip()
@@ -195,6 +214,7 @@ def parse_pdf_data(pdf_file_path, file_name):
         df_gemini['Date'] = df_gemini['Date'].astype(str)
         df_gemini['Description'] = df_gemini['Description'].astype(str)
         
+        # Use clean_value to standardize the numbers and convert any lingering 'Dr' to '-'
         df_gemini['Amount'] = df_gemini['Amount'].apply(lambda x: clean_value(x)) 
         df_gemini.dropna(subset=['Amount'], inplace=True)
         
@@ -213,14 +233,14 @@ if 'uploaded_files' not in st.session_state:
 
 st.set_page_config(page_title="🇿🇦 Free SA Bank Statement to CSV Converter (AI Column-Only Filter)", layout="wide")
 
-st.title("🇿🇦 SA Bank Statement PDF to CSV Converter (AI-Only - Dynamic Year)")
+st.title("🇿🇦 SA Bank Statement PDF to CSV Converter (AI-Only - Dynamic Year & Sign Enforcement)")
 st.markdown("""
-    ### Now using **Gemini AI exclusively** to **dynamically extract the statement year** and transactions, filtering only the dedicated Fees (R) column.
+    ### Now using **Gemini AI exclusively** to **dynamically extract the statement year** and transactions, filtering only the dedicated Fees (R) column. **Credit/Debit sign is enforced** (Credit=Positive, Debit=Negative).
     ---
 """)
 
 if client:
-    st.sidebar.success("Gemini AI Engine: **Active** ✅ (Exclusive Use - **Dynamic Year Extraction**)")
+    st.sidebar.success("Gemini AI Engine: **Active** ✅ (Exclusive Use - **Dynamic Year & Sign Enforcement**)")
 else:
     st.sidebar.warning("Gemini AI Engine: **Inactive** 🛑. Please set **GEMINI_API_KEY** in Streamlit Secrets.")
 
