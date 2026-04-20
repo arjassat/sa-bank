@@ -1,0 +1,7 @@
+streamlit
+paddleocr
+paddlepaddle
+pdf2image
+pandas
+numpy
+opencv-python-headless
